@@ -1,0 +1,35 @@
+command:
+  - "python3"
+  - "scripts/start_app.py"
+
+env:
+  # Bound to the 'postgres' resource declared in resources/librechat.app.yml.
+  # Databricks Apps also auto-injects PGHOST, PGPORT, PGDATABASE, PGUSER, PGSSLMODE=require.
+  - name: LAKEBASE_ENDPOINT
+    valueFrom: postgres
+
+  # Upstream unmodified LibreChat tag/branch (https://github.com/LibreChat-AI/LibreChat)
+  - name: LIBRECHAT_VERSION
+    value: "v0.8.8"
+
+  # Embedded ephemeral MongoDB connection string (the only change for MongoDB)
+  - name: MONGO_URI
+    value: "mongodb://127.0.0.1:27017/LibreChat"
+
+  # Lakebase PostgreSQL schema for LibreChat RAG / pgvector persistent storage
+  - name: POSTGRES_SCHEMA
+    value: "librechat,public"
+
+  # Databricks Unity Gateway 3-level namespace (catalog.schema.model_service_name) Models
+  - name: UNITY_GATEWAY_DEFAULT_MODEL
+    value: "system.ai.claude-sonnet-4-5"
+
+  - name: UNITY_GATEWAY_MODELS
+    value: "system.ai.claude-sonnet-4-5,system.ai.claude-opus-4-5,system.ai.gpt-5-6-sol"
+
+  - name: UNITY_GATEWAY_EMBEDDING_MODEL
+    value: "system.ai.databricks-gte-large-en"
+
+  # Databricks Unity Gateway 3-level namespace (catalog.schema.mcp_service_name) MCP Services
+  - name: UNITY_GATEWAY_MCP_SERVICES
+    value: "system.ai.dbsql,system.ai.genie_one_mcp,system.ai.web_search"

@@ -1,0 +1,107 @@
+# =============================================================================
+# LibreChat Configuration for Databricks Unity Gateway (Models & MCP Services)
+# =============================================================================
+# Docs:
+# - Unity Gateway Overview: https://docs.databricks.com/aws/en/ai-gateway/
+# - Query 3-level Model Services: https://docs.databricks.com/aws/en/ai-gateway/query-model-services
+# - Query 3-level MCP Services: https://docs.databricks.com/aws/en/agents/mcp-tools/
+version: 1.3.6
+cache: true
+
+interface:
+  customWelcome: "Welcome to LibreChat on Databricks Apps — governed by Unity Gateway & backed by Lakebase Autoscaling"
+  endpointsMenu: true
+  modelSelect: true
+  parameters: true
+  sidePanel: true
+  presets: true
+  prompts: true
+  bookmarks: true
+  multiConvo: true
+  agents: true
+  mcpServers:
+    placeholder: "Select Databricks Unity Gateway MCP Services"
+
+registration:
+  socialLogins: []
+
+# Allow local OBO gateway loopback if needed alongside direct Unity Gateway host
+mcpSettings:
+  allowedAddresses:
+    - "127.0.0.1:3081"
+
+# =============================================================================
+# Databricks Unity Gateway MCP Services (catalog.schema.mcp_service_name)
+# =============================================================================
+# Using {{LIBRECHAT_USER_EMAIL}} in headers instructs LibreChat to create
+# user-scoped MCP connections and pass the caller's identity on every tool
+# discovery and tool call so the OBO preload hook injects the user's
+# `x-forwarded-access-token` from Databricks Apps.
+mcpServers:
+  "system.ai.dbsql":
+    type: streamable-http
+    title: "Databricks SQL (system.ai.dbsql)"
+    description: "Execute governed SQL queries and explore schemas via Unity Gateway"
+    url: "https://${DATABRICKS_HOST}/ai-gateway/mcp-services/system.ai.dbsql"
+    timeout: 120000
+    initTimeout: 30000
+    chatMenu: true
+    startup: false
+    headers:
+      Authorization: "Bearer ${DATABRICKS_TOKEN}"
+      x-librechat-user-email: "{{LIBRECHAT_USER_EMAIL}}"
+      x-librechat-user-id: "{{LIBRECHAT_USER_ID}}"
+
+  "system.ai.genie_one_mcp":
+    type: streamable-http
+    title: "Databricks Genie One (system.ai.genie_one_mcp)"
+    description: "Natural-language business analytics grounded in Genie Ontology via Unity Gateway"
+    url: "https://${DATABRICKS_HOST}/ai-gateway/mcp-services/system.ai.genie_one_mcp"
+    timeout: 120000
+    initTimeout: 30000
+    chatMenu: true
+    startup: false
+    headers:
+      Authorization: "Bearer ${DATABRICKS_TOKEN}"
+      x-librechat-user-email: "{{LIBRECHAT_USER_EMAIL}}"
+      x-librechat-user-id: "{{LIBRECHAT_USER_ID}}"
+
+  "system.ai.web_search":
+    type: streamable-http
+    title: "Databricks Web Search (system.ai.web_search)"
+    description: "Governed web search through Databricks Unity Gateway"
+    url: "https://${DATABRICKS_HOST}/ai-gateway/mcp-services/system.ai.web_search"
+    timeout: 60000
+    initTimeout: 30000
+    chatMenu: true
+    startup: false
+    headers:
+      Authorization: "Bearer ${DATABRICKS_TOKEN}"
+      x-librechat-user-email: "{{LIBRECHAT_USER_EMAIL}}"
+      x-librechat-user-id: "{{LIBRECHAT_USER_ID}}"
+
+# =============================================================================
+# Databricks Unity Gateway Model Services (catalog.schema.model_service_name)
+# =============================================================================
+endpoints:
+  allowedAddresses:
+    - "127.0.0.1:3081"
+
+  custom:
+    - name: "Databricks Unity Gateway"
+      apiKey: "${DATABRICKS_TOKEN}"
+      baseURL: "https://${DATABRICKS_HOST}/ai-gateway/mlflow/v1"
+      headers:
+        x-librechat-user-email: "{{LIBRECHAT_USER_EMAIL}}"
+        x-librechat-user-id: "{{LIBRECHAT_USER_ID}}"
+      models:
+        default:
+          - "system.ai.claude-sonnet-4-5"
+          - "system.ai.claude-opus-4-5"
+          - "system.ai.gpt-5-6-sol"
+        fetch: false
+      titleConvo: true
+      titleModel: "system.ai.claude-sonnet-4-5"
+      summarize: false
+      forcePrompt: false
+      modelDisplayLabel: "Unity Gateway"

@@ -1,0 +1,65 @@
+# yaml-language-server: $schema=bundle_config_schema.json
+bundle:
+  name: databricks-librechat
+
+include:
+  - resources/*.yml
+
+variables:
+  app_name:
+    description: "Name of the Databricks App running LibreChat"
+    default: "librechat-app"
+
+  app_compute_size:
+    description: "Compute size for the Databricks App (MEDIUM or LARGE)"
+    default: "LARGE"
+
+  lakebase_project_id:
+    description: "Lakebase Autoscaling PostgreSQL project ID (1-63 lowercase alphanumeric/hyphens)"
+    default: "librechat-lakebase"
+
+  lakebase_display_name:
+    description: "Display name for the Lakebase Autoscaling PostgreSQL project"
+    default: "LibreChat Lakebase Autoscaling"
+
+  lakebase_branch:
+    description: "Lakebase branch name (default branch created with project is 'production')"
+    default: "production"
+
+  lakebase_database:
+    description: "Lakebase PostgreSQL database name (default created with project is 'databricks_postgres')"
+    default: "databricks_postgres"
+
+  librechat_version:
+    description: "Upstream LibreChat git tag/branch to run unmodified from https://github.com/LibreChat-AI/LibreChat"
+    default: "v0.8.8"
+
+  unity_gateway_default_model:
+    description: "Default 3-level namespace model service in Unity Gateway (catalog.schema.model_service_name)"
+    default: "system.ai.claude-sonnet-4-5"
+
+  unity_gateway_models:
+    description: "Comma-separated list of 3-level namespace model services in Unity Gateway (catalog.schema.model_service_name)"
+    default: "system.ai.claude-sonnet-4-5,system.ai.claude-opus-4-5,system.ai.gpt-5-6-sol"
+
+  unity_gateway_embedding_model:
+    description: "3-level namespace embedding model service in Unity Gateway used by LibreChat RAG API + Lakebase pgvector"
+    default: "system.ai.databricks-gte-large-en"
+
+  unity_gateway_mcp_services:
+    description: "Comma-separated list of 3-level namespace MCP services in Unity Gateway (catalog.schema.mcp_service_name)"
+    default: "system.ai.dbsql,system.ai.genie_one_mcp,system.ai.web_search"
+
+targets:
+  dev:
+    mode: development
+    default: true
+    variables:
+      app_name: "librechat-dev"
+      lakebase_project_id: "librechat-lakebase-dev"
+
+  prod:
+    mode: production
+    variables:
+      app_name: "librechat"
+      lakebase_project_id: "librechat-lakebase"

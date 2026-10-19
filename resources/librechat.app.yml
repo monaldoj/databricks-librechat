@@ -1,0 +1,28 @@
+resources:
+  apps:
+    librechat_app:
+      name: ${var.app_name}
+      description: "Unmodified LibreChat on Databricks Apps with Lakebase Autoscaling (PostgreSQL), embedded ephemeral MongoDB, and Unity Gateway OBO for 3-level namespace Models & MCPs"
+      source_code_path: ../app
+      compute_size: ${var.app_compute_size}
+
+      # User API scopes required for On-Behalf-Of (OBO) authentication
+      # (`x-forwarded-access-token`) to Databricks Unity Gateway Models and MCPs.
+      user_api_scopes:
+        - ai-gateway
+        - model-serving
+        - sql
+        - genie
+        - files
+        - vector-search
+        - postgres
+        - iam.current-user:read
+        - iam.access-control:read
+
+      resources:
+        - name: postgres
+          description: "Lakebase Autoscaling PostgreSQL database for LibreChat persistent storage"
+          postgres:
+            branch: ${resources.postgres_branches.librechat_branch.id}
+            database: ${resources.postgres_branches.librechat_branch.id}/databases/${var.lakebase_database}
+            permission: CAN_CONNECT_AND_CREATE
