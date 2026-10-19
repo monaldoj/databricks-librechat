@@ -330,6 +330,48 @@ service principal and are not user-attributed**.
 
 ---
 
+## Two things the proxy and SSRF guard must get right
+
+### Compressed responses pass through untouched
+
+LibreChat serves Brotli when the browser advertises it. The ingress proxy's aiohttp session
+therefore runs with **`auto_decompress=False`** and forwards `Content-Encoding` intact.
+Without that, aiohttp tries to decode the body, has no Brotli codec, and every page load
+500s:
+
+```
+aiohttp.client_exceptions.ClientResponseError: 400,
+  message='Can not decode content-encoding: brotli (br). Please install `Brotli`',
+  url='http://127.0.0.1:3080/'
+```
+
+**Do not "fix" this by adding `brotli` to `requirements.txt`.** A reverse proxy has no reason
+to decode at all; passing the compressed bytes straight through is correct, cheaper, and keeps
+compression end-to-end for the browser. The only requests made with `Accept-Encoding: identity`
+are the handful whose body the proxy itself parses (the `/api/auth/refresh` interception, the
+SSO auto-login, and the loopback embeddings bridge).
+
+### The workspace host needs an SSRF exemption
+
+Inside the Databricks Apps VPC the workspace hostname resolves to a **private** IP. LibreChat's
+SSRF guard (`resolveHostnameSSRF`) therefore rejects it and every MCP server fails to
+initialize:
+
+```
+[MCPServersRegistry] Failed to inspect server "system.ai.dbsql":
+  Domain "https://<workspace-host>" is not allowed
+```
+
+`start_app.py` renders three entries to cover this, using the live host:
+
+| Config key | Value | Why |
+|---|---|---|
+| `mcpSettings.allowedDomains` | `https://<host>` | A non-empty allowlist short-circuits the MCP SSRF check entirely |
+| `mcpSettings.allowedAddresses` | `<host>:443` | The documented exemption for a hostname that resolves to a private IP |
+| `endpoints.allowedAddresses` | `<host>:443` | Same, for the Unity Gateway model endpoint |
+
+Re-rendering is idempotent, so these never accumulate duplicates.
+
 ## Known limitations
 
 - **Streaming is capped at 120 seconds.** The Databricks Apps reverse proxy enforces a
@@ -346,6 +388,10 @@ service principal and are not user-attributed**.
   scope so sessions and stored credentials survive restarts.
 - **Meilisearch is disabled** (`SEARCH=false`); LibreChat's full-text conversation search is
   unavailable.
+- **`SCHEDULES_SINGLE_PROCESS=true`** is set, asserting this deployment runs exactly one
+  replica — which the pinned `compute_min_instances`/`compute_max_instances` of 1 guarantees.
+  Without it LibreChat refuses all schedule writes with a 503. **Revisit this if the instance
+  count is ever raised**, which also requires an external MongoDB.
 - **OBO scopes can be wiped by a destructive app update.** Re-check `user_api_scopes` after
   any out-of-band change to the app.
 

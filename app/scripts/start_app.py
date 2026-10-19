@@ -409,6 +409,49 @@ def restart_rag_api() -> None:
 # =============================================================================
 # 2. Render `/tmp/librechat.yaml` with 3-Level Namespace Models & MCPs
 # =============================================================================
+# Hop-by-hop headers aiohttp recomputes for the response it actually sends.
+# `content-encoding` is deliberately NOT in this list: the ingress proxy passes
+# compressed bodies through untouched (see `make_http_session`), so the encoding
+# header must survive for the browser to decode them.
+HOP_BY_HOP_RESPONSE_HEADERS = ("content-length", "transfer-encoding")
+
+
+def copy_response_headers(src_headers, dst) -> None:
+    """Copies upstream response headers onto `dst`, dropping only hop-by-hop ones."""
+    for k, v in src_headers.items():
+        if k.lower() not in HOP_BY_HOP_RESPONSE_HEADERS:
+            dst.headers.add(k, v)
+
+
+def identity_encoding(headers: Dict[str, str]) -> Dict[str, str]:
+    """
+    Returns `headers` with `Accept-Encoding: identity`.
+
+    Used for the few upstream calls whose body this proxy must parse itself. The
+    shared client session runs with `auto_decompress=False`, so a compressed
+    response would otherwise arrive as opaque bytes that `json.loads` cannot read.
+    """
+    out = {k: v for k, v in headers.items() if k.lower() != "accept-encoding"}
+    out["Accept-Encoding"] = "identity"
+    return out
+
+
+def make_http_session() -> aiohttp.ClientSession:
+    """
+    Builds the shared client session for proxying.
+
+    `auto_decompress=False` is essential. LibreChat serves Brotli
+    (`Content-Encoding: br`) when the browser advertises it, and aiohttp would
+    otherwise try to decode it and fail the whole request with:
+        Can not decode content-encoding: brotli (br). Please install `Brotli`
+    returning a 500 for every page load. A reverse proxy has no reason to decode
+    at all -- passing the compressed bytes straight through is both correct and
+    cheaper, and keeps compression intact end-to-end for the browser.
+    """
+    timeout = aiohttp.ClientTimeout(total=900, connect=30, sock_read=600)
+    return aiohttp.ClientSession(timeout=timeout, auto_decompress=False)
+
+
 def parse_csv_env(name: str, default: str) -> List[str]:
     raw = os.environ.get(name, default)
     return [item.strip() for item in raw.split(",") if item.strip()]
@@ -444,6 +487,7 @@ def render_librechat_yaml() -> Path:
     mcp_services = parse_csv_env("UNITY_GATEWAY_MCP_SERVICES", DEFAULT_MCP_SERVICES)
 
     # 1. Configure 3-level namespace Model Services via Unity Gateway (/ai-gateway/mlflow/v1)
+    #    (`endpoints` is created here if absent; the SSRF step below extends it.)
     custom_endpoints = config.setdefault("endpoints", {}).setdefault("custom", [])
     if custom_endpoints:
         ugw_endpoint = custom_endpoints[0]
@@ -456,7 +500,33 @@ def render_librechat_yaml() -> Path:
             os.environ.get("UNITY_GATEWAY_TITLE_MODEL") or DEFAULT_TITLE_MODEL
         ).strip()
 
-    # 2. Configure 3-level namespace MCP Services via Unity Gateway (/ai-gateway/mcp-services/<catalog>.<schema>.<service>)
+    # 2. Allow the workspace host through LibreChat's SSRF guard.
+    #
+    # Inside the Databricks Apps VPC the workspace hostname resolves to a PRIVATE
+    # IP, so LibreChat's `resolveHostnameSSRF` blocks it and every MCP server
+    # fails to initialize with:
+    #     Failed to inspect server "system.ai.dbsql":
+    #     Domain "https://<workspace-host>" is not allowed
+    # `mcpSettings.allowedDomains` short-circuits that check for MCP, and the
+    # `<host>:443` entries in `allowedAddresses` are exactly the documented
+    # exemption for "a hostname that resolves to a private IP".
+    host = STATE.databricks_host
+    host_origin = f"https://{host}"
+    host_address = f"{host}:443"
+
+    mcp_settings = config.setdefault("mcpSettings", {})
+    mcp_domains = [d for d in (mcp_settings.get("allowedDomains") or []) if d]
+    if host_origin not in mcp_domains:
+        mcp_domains.append(host_origin)
+    mcp_settings["allowedDomains"] = mcp_domains
+
+    for section in (mcp_settings, config.setdefault("endpoints", {})):
+        addrs = [a for a in (section.get("allowedAddresses") or []) if a]
+        if host_address not in addrs:
+            addrs.append(host_address)
+        section["allowedAddresses"] = addrs
+
+    # 3. Configure 3-level namespace MCP Services via Unity Gateway (/ai-gateway/mcp-services/<catalog>.<schema>.<service>)
     mcp_servers_cfg = config.get("mcpServers") or {}
     rendered_mcps: Dict[str, Any] = {}
     for mcp_fqn in mcp_services:
@@ -1022,6 +1092,12 @@ def start_librechat_backend(config_path: Path) -> None:
             "CREDS_KEY": CREDS_KEY,
             "CREDS_IV": CREDS_IV,
             "SEARCH": "false",
+            # The app resource pins compute_min_instances == compute_max_instances == 1,
+            # so this process really is the only replica. Without this assertion
+            # LibreChat refuses all schedule writes with a 503 and logs
+            # "[schedules] scheduler NOT started". Must be revisited if the
+            # instance count is ever raised (which requires an external MongoDB).
+            "SCHEDULES_SINGLE_PROCESS": os.environ.get("SCHEDULES_SINGLE_PROCESS", "true"),
         }
     )
 
@@ -1108,12 +1184,14 @@ async def auto_login_databricks_sso_user(
     password = derive_sso_password(clean_email)
     base = f"http://127.0.0.1:{LIBRECHAT_INTERNAL_PORT}"
 
-    headers = {
-        "Content-Type": "application/json",
-        "Origin": base,
-        "Referer": f"{base}/login",
-        **obo_headers,
-    }
+    headers = identity_encoding(
+        {
+            "Content-Type": "application/json",
+            "Origin": base,
+            "Referer": f"{base}/login",
+            **obo_headers,
+        }
+    )
 
     try:
         reg_payload = {
@@ -1375,10 +1453,11 @@ async def handle_ingress_proxy(request: web.Request) -> web.StreamResponse:
 
     # Seamless Databricks SSO auto-provisioning on /api/auth/refresh when MongoDB is ephemeral
     if request.method == "POST" and request.path == "/api/auth/refresh" and obo_email:
+        # This body is parsed below, so ask for it uncompressed.
         async with session.request(
             request.method,
             target_url,
-            headers=req_headers,
+            headers=identity_encoding(req_headers),
             data=body,
             allow_redirects=False,
         ) as upstream_resp:
@@ -1393,9 +1472,7 @@ async def handle_ingress_proxy(request: web.Request) -> web.StreamResponse:
 
             if has_valid_token:
                 out = web.Response(status=upstream_resp.status, body=resp_bytes)
-                for k, v in upstream_resp.headers.items():
-                    if k.lower() not in ("content-length", "transfer-encoding", "content-encoding"):
-                        out.headers.add(k, v)
+                copy_response_headers(upstream_resp.headers, out)
                 return out
 
         # No valid local session yet in ephemeral MongoDB -> auto-register & login SSO user
@@ -1409,9 +1486,7 @@ async def handle_ingress_proxy(request: web.Request) -> web.StreamResponse:
             try:
                 login_bytes = await login_resp.read()
                 out = web.Response(status=login_resp.status, body=login_bytes)
-                for k, v in login_resp.headers.items():
-                    if k.lower() not in ("content-length", "transfer-encoding", "content-encoding"):
-                        out.headers.add(k, v)
+                copy_response_headers(login_resp.headers, out)
                 return out
             finally:
                 login_resp.close()
@@ -1428,9 +1503,7 @@ async def handle_ingress_proxy(request: web.Request) -> web.StreamResponse:
 
         if is_sse:
             stream_resp = web.StreamResponse(status=upstream_resp.status)
-            for k, v in upstream_resp.headers.items():
-                if k.lower() not in ("content-length", "transfer-encoding", "content-encoding"):
-                    stream_resp.headers.add(k, v)
+            copy_response_headers(upstream_resp.headers, stream_resp)
             await stream_resp.prepare(request)
             async for chunk in upstream_resp.content.iter_any():
                 await stream_resp.write(chunk)
@@ -1439,9 +1512,7 @@ async def handle_ingress_proxy(request: web.Request) -> web.StreamResponse:
 
         resp_bytes = await upstream_resp.read()
         out = web.Response(status=upstream_resp.status, body=resp_bytes)
-        for k, v in upstream_resp.headers.items():
-            if k.lower() not in ("content-length", "transfer-encoding", "content-encoding"):
-                out.headers.add(k, v)
+        copy_response_headers(upstream_resp.headers, out)
         return out
 
 
@@ -1481,6 +1552,9 @@ async def handle_obo_bridge(request: web.Request) -> web.StreamResponse:
         )
     }
     fwd_headers["Authorization"] = f"Bearer {token}"
+    # The RAG API consumes these responses directly; keep them uncompressed so
+    # there is no encoding to negotiate through the loopback hop.
+    fwd_headers = identity_encoding(fwd_headers)
     logger.info("[UnityGateway-OBO:Bridge] %s %s -> auth=%s", request.method, target_url, source)
 
     body = await request.read()
@@ -1494,15 +1568,12 @@ async def handle_obo_bridge(request: web.Request) -> web.StreamResponse:
     ) as resp:
         resp_bytes = await resp.read()
         out = web.Response(status=resp.status, body=resp_bytes)
-        for k, v in resp.headers.items():
-            if k.lower() not in ("content-length", "transfer-encoding", "content-encoding"):
-                out.headers.add(k, v)
+        copy_response_headers(resp.headers, out)
         return out
 
 
 async def start_servers() -> None:
-    timeout = aiohttp.ClientTimeout(total=900, connect=30, sock_read=600)
-    http_session = aiohttp.ClientSession(timeout=timeout)
+    http_session = make_http_session()
 
     # 1. Start Ingress Server on 0.0.0.0:${DATABRICKS_APP_PORT}
     ingress_app = web.Application(client_max_size=100 * 1024 * 1024)
