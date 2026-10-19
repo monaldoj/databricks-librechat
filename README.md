@@ -247,6 +247,36 @@ databricks ai-gateway list-model-services -p <profile>
 databricks ai-gateway list-mcp-services   -p <profile>
 ```
 
+#### The server key must not contain a dot
+
+LibreChat names every model-facing tool `${toolName}_mcp_${serverName}`
+(`Constants.mcp_delimiter`), where `serverName` is the **key** in the `mcpServers` map.
+Anthropic validates tool names against `^[a-zA-Z0-9_-]{1,128}$` — no dots — while
+LibreChat's own `normalizeServerName` allows `[a-zA-Z0-9_.-]` and passes a dotted name
+straight through. Using a three-level FQN as the key therefore sends Claude
+`web_search_mcp_system.ai.web_search`, and *every* tool-enabled request fails:
+
+```json
+{"error_code":"BAD_REQUEST",
+ "message":"{\"message\":\"tools.0.custom.name: String should match pattern '^[a-zA-Z0-9_-]{1,128}$'\"}"}
+```
+
+Note this is a **model-side** failure, not an MCP one: the MCP handshake succeeds and the
+tools load, then the chat request carrying them is rejected. So it looks like "MCP is
+broken" when the tool *name* is what's wrong.
+
+So the key is the underscored form (`system_ai_web_search`) and the three-level namespace
+lives in `url` — which is what actually routes to the service — and in `description`.
+Governance is unchanged; only LibreChat's internal identifier differs.
+`scripts/start_app.py` (`safe_mcp_server_key`) applies the same mapping to anything named
+in `unity_gateway_mcp_services`, so you can still write FQNs there. It also:
+
+- caps the key at 60 characters with a short digest, since Unity Catalog permits 63
+  characters *per level* (a ~191-character FQN would otherwise blow Anthropic's 128-char
+  budget once the tool name and `_mcp_` are added), and
+- disambiguates the case where two FQNs sanitize to the same key (`a.b.c` and `a_b.c`)
+  instead of silently dropping one.
+
 ### Overriding them
 
 These are real bundle variables, resolved into the app's `config.env` at deploy time:

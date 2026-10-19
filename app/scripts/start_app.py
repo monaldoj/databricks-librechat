@@ -211,6 +211,26 @@ NODE_VERSION_STAMP = Path("/tmp/librechat/.dbx-node-version")
 # underscores makes LibreChat reject the entire config and exit at startup.
 MCP_TITLE_ALLOWED = re.compile(r"[^\w \-']|_", re.UNICODE)
 
+# LibreChat builds the model-facing tool name as `${toolName}_mcp_${serverName}`
+# (`Constants.mcp_delimiter`), where `serverName` is the KEY in the `mcpServers`
+# map. Anthropic validates that name against ^[a-zA-Z0-9_-]{1,128}$ -- which
+# does NOT allow dots -- while LibreChat's own `normalizeServerName` permits
+# `[a-zA-Z0-9_.-]` and so passes a dotted name straight through. A three-level
+# FQN used as the key therefore reaches Claude as
+# `web_search_mcp_system.ai.web_search` and Unity Gateway rejects every
+# tool-enabled request with:
+#   tools.0.custom.name: String should match pattern '^[a-zA-Z0-9_-]{1,128}$'
+# The three-level namespace still identifies the service in `url` (which is what
+# actually routes) and in `description`; the key only has to be a stable, legal,
+# unique identifier.
+MCP_SERVER_KEY_ILLEGAL = re.compile(r"[^a-zA-Z0-9_-]")
+
+# Anthropic's limit is 128 for the WHOLE tool name, and the upstream tool name
+# plus `_mcp_` share that budget. Unity Catalog allows 63 characters per level,
+# so a three-level FQN can reach ~191 on its own; cap the key well below the
+# limit and keep it unique with a short digest of the original.
+MCP_SERVER_KEY_MAX = 60
+
 # Shared cryptographic secrets generated once per app boot if not provided
 JWT_SECRET = os.environ.get("JWT_SECRET") or secrets.token_hex(32)
 JWT_REFRESH_SECRET = os.environ.get("JWT_REFRESH_SECRET") or secrets.token_hex(32)
@@ -524,6 +544,17 @@ def parse_csv_env(name: str, default: str) -> List[str]:
     return [item.strip() for item in raw.split(",") if item.strip()]
 
 
+def safe_mcp_server_key(fqn: str) -> str:
+    """Map a three-level service name to a key that is legal inside an
+    Anthropic tool name (see MCP_SERVER_KEY_ILLEGAL)."""
+    key = MCP_SERVER_KEY_ILLEGAL.sub("_", fqn or "")
+    key = re.sub(r"_{2,}", "_", key).strip("_")
+    if len(key) > MCP_SERVER_KEY_MAX:
+        digest = hashlib.sha256((fqn or "").encode("utf-8")).hexdigest()[:8]
+        key = f"{key[: MCP_SERVER_KEY_MAX - 9].rstrip('_')}_{digest}"
+    return key or "mcp_service"
+
+
 def safe_mcp_title(raw: str, fqn: str) -> str:
     """
     Coerces a title into LibreChat's MCP title grammar
@@ -608,9 +639,23 @@ def render_librechat_yaml() -> Path:
     mcp_servers_cfg = config.get("mcpServers") or {}
     rendered_mcps: Dict[str, Any] = {}
     for mcp_fqn in mcp_services:
-        existing = mcp_servers_cfg.get(mcp_fqn, {})
+        # Accept either spelling in the template: the sanitized key (what this
+        # renderer emits) or the raw three-level FQN.
+        server_key = safe_mcp_server_key(mcp_fqn)
+        existing = mcp_servers_cfg.get(server_key) or mcp_servers_cfg.get(mcp_fqn) or {}
+
+        # Two distinct FQNs can sanitize to the same key (`a.b.c` and `a_b.c`).
+        # Keep the first and disambiguate the rest rather than silently
+        # dropping a configured service.
+        if server_key in rendered_mcps:
+            digest = hashlib.sha256(mcp_fqn.encode("utf-8")).hexdigest()[:8]
+            server_key = f"{server_key[: MCP_SERVER_KEY_MAX - 9].rstrip('_')}_{digest}"
+            STATE.add_log(
+                f"MCP server key collision for {mcp_fqn}; using {server_key} instead"
+            )
+
         leaf = mcp_fqn.rsplit(".", 1)[-1].replace("_", " ").replace("-", " ").title()
-        rendered_mcps[mcp_fqn] = {
+        rendered_mcps[server_key] = {
             "type": existing.get("type", "streamable-http"),
             # Sanitized unconditionally, including titles that came from the
             # template, so a hand-edited librechat.yaml cannot take the app down.

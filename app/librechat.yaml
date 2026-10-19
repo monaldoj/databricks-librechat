@@ -52,8 +52,20 @@ mcpSettings:
 # `startup: false` keeps these out of app-level shared connections so each
 # connection is created per user, and the OBO preload hook injects that user's
 # `x-forwarded-access-token`.
+#
+# IMPORTANT -- the KEY below must not contain dots. LibreChat names each
+# model-facing tool `${toolName}_mcp_${serverName}` using this key as
+# `serverName`, and Anthropic validates tool names against
+#   ^[a-zA-Z0-9_-]{1,128}$
+# LibreChat's own `normalizeServerName` allows `[a-zA-Z0-9_.-]`, so it passes a
+# dotted key straight through and every tool-enabled Claude request fails with:
+#   tools.0.custom.name: String should match pattern '^[a-zA-Z0-9_-]{1,128}$'
+# So the key is the underscored form and the three-level namespace lives in
+# `url` -- which is what actually routes to the service -- and `description`.
+# `scripts/start_app.py` (`safe_mcp_server_key`) applies the same mapping to
+# anything named in UNITY_GATEWAY_MCP_SERVICES.
 mcpServers:
-  "system.ai.dbsql":
+  system_ai_dbsql:
     type: streamable-http
     title: "Databricks SQL"
     description: "Execute governed SQL queries and explore schemas via Unity Gateway (system.ai.dbsql)"
@@ -67,7 +79,7 @@ mcpServers:
       x-librechat-user-email: "{{LIBRECHAT_USER_EMAIL}}"
       x-librechat-user-id: "{{LIBRECHAT_USER_ID}}"
 
-  "system.ai.genie_one_mcp":
+  system_ai_genie_one_mcp:
     type: streamable-http
     title: "Databricks Genie One"
     description: "Natural-language business analytics grounded in Genie Ontology via Unity Gateway (system.ai.genie_one_mcp)"
@@ -81,7 +93,7 @@ mcpServers:
       x-librechat-user-email: "{{LIBRECHAT_USER_EMAIL}}"
       x-librechat-user-id: "{{LIBRECHAT_USER_ID}}"
 
-  "system.ai.web_search":
+  system_ai_web_search:
     type: streamable-http
     title: "Databricks Web Search"
     description: "Governed web search through Databricks Unity Gateway (system.ai.web_search)"
