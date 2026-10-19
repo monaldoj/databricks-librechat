@@ -100,6 +100,15 @@ mcpServers:
 # =============================================================================
 # Verified: POST https://<host>/ai-gateway/mlflow/v1/chat/completions with
 # {"model": "system.ai.claude-sonnet-5-5", ...} returns an OpenAI-shaped 200.
+#
+# Unity Gateway exposes two unified, provider-agnostic APIs on this baseURL --
+# `/chat/completions` and `/responses` -- and every `system.ai.claude-*` service
+# lists BOTH in its `supported_api_types`. We use `/chat/completions` because it
+# is what LibreChat's `custom` endpoint speaks natively, and because it is the
+# *more* permissive of the two for Anthropic (it tolerates `temperature: 1`,
+# which `/responses` rejects outright). "Unified" means one request shape across
+# providers -- it does NOT mean the gateway normalizes away per-provider
+# parameter support, so see `dropParams` below.
 endpoints:
   allowedAddresses:
     - "127.0.0.1:3081"
@@ -118,6 +127,60 @@ endpoints:
           - "system.ai.claude-haiku-5-5"
           - "system.ai.gpt-5-6-sol"
         fetch: false
+
+      # REQUIRED for the Anthropic (`system.ai.claude-*`) model services.
+      #
+      # LibreChat's conversation schema injects OpenAI sampling defaults on
+      # EVERY request even when the user never touches a slider
+      # (packages/data-provider/src/schemas.ts):
+      #     temperature: 1, top_p: 1, presence_penalty: 0, frequency_penalty: 0
+      # Unity Gateway forwards those to the provider, and the Anthropic model
+      # services reject them, so each one is a hard 400 on every Claude call:
+      #     BAD_REQUEST: Model us.anthropic.claude-sonnet-5-5 does not support
+      #                  sampling parameters: top_p
+      #     BAD_REQUEST: Model us.anthropic.claude-sonnet-5-5 does not support
+      #                  the temperature parameter.
+      #     {"message":"presence_penalty: Extra inputs are not permitted"}
+      #
+      # The GPT services appear to work only because LibreChat already strips
+      # these for anything matching /\b(o[13]|gpt-5)(?!\.|-chat)(?:-|$)/
+      # (packages/api/src/endpoints/openai/llm.ts) -- a pattern `claude-*`
+      # cannot match. `dropParams` is how an administrator extends that same
+      # stripping to a non-OpenAI provider; it also tells the client to hide
+      # the corresponding UI controls instead of sending values that 400.
+      #
+      # Both spellings of each parameter are listed on purpose: LibreChat keeps
+      # `knownOpenAIParams` in camelCase on `llmConfig` and passes everything
+      # else through to `modelKwargs` in snake_case, and `deleteConfigParam`
+      # does a literal key delete on both objects. Entries that match nothing
+      # are harmless no-ops. Each entry below was confirmed to 400 against
+      # `system.ai.claude-sonnet-5-5` on this gateway.
+      #
+      # NOTE: `response_format` is dropped because the gateway reports
+      # "Structured output is not supported for this model" for these Anthropic
+      # services -- it can only ever 400 here. That also disables explicit
+      # structured output for the GPT models on this shared endpoint, which the
+      # chat path does not use. Remove it if you add a model that needs it.
+      dropParams:
+        - "temperature"
+        - "topP"
+        - "top_p"
+        - "topK"
+        - "top_k"
+        - "frequencyPenalty"
+        - "frequency_penalty"
+        - "presencePenalty"
+        - "presence_penalty"
+        - "logitBias"
+        - "logit_bias"
+        - "logprobs"
+        - "topLogprobs"
+        - "top_logprobs"
+        - "seed"
+        - "user"
+        - "parallel_tool_calls"
+        - "response_format"
+
       titleConvo: true
       titleModel: "system.ai.claude-haiku-5-5"
       summarize: false

@@ -187,6 +187,52 @@ under `system.ai`). Conversation titles use `unity_gateway_title_model`
 Embeddings default to **`system.ai.gte-large-en`** (1024-dim). Note that
 `system.ai.databricks-gte-large-en` does *not* exist and returns `404 NOT_FOUND`.
 
+#### "Unified" does not mean parameters are normalized
+
+Unity Gateway exposes two unified, provider-agnostic APIs on the same `baseURL` --
+`/chat/completions` and `/responses` -- and every `system.ai.claude-*` service lists both
+in its `supported_api_types`. But *unified* describes the **request shape**, not the
+**parameter surface**: the gateway still forwards sampling parameters to the provider,
+and Anthropic rejects the ones OpenAI takes for granted.
+
+LibreChat's conversation schema injects OpenAI sampling defaults on every request even
+when nobody touches the parameters panel
+([`schemas.ts`](https://github.com/danny-avila/LibreChat/blob/v0.8.8/packages/data-provider/src/schemas.ts)):
+`temperature: 1`, `top_p: 1`, `presence_penalty: 0`, `frequency_penalty: 0`. Against a
+Claude model service each of those is a hard `400`:
+
+```
+BAD_REQUEST: Model us.anthropic.claude-sonnet-5-5 does not support sampling parameters: top_p
+BAD_REQUEST: Model us.anthropic.claude-sonnet-5-5 does not support the temperature parameter.
+{"message":"presence_penalty: Extra inputs are not permitted"}
+```
+
+Switching to `/responses` does **not** help -- it returns the identical errors, and is in
+fact *stricter* (it rejects even `temperature: 1`, which `/chat/completions` accepts).
+
+The GPT services only appear to work because LibreChat already strips these parameters for
+any model matching `/\b(o[13]|gpt-5)(?!\.|-chat)(?:-|$)/`
+([`llm.ts`](https://github.com/danny-avila/LibreChat/blob/v0.8.8/packages/api/src/endpoints/openai/llm.ts))
+— a pattern `claude-*` can never match. `system.ai.gpt-5-6-sol` matches it; every
+`system.ai.claude-*` does not.
+
+The fix is the `dropParams` list on the custom endpoint in `app/librechat.yaml`, which
+`scripts/start_app.py` also injects so it cannot be lost. It extends that same stripping to
+a non-OpenAI provider and tells the client to hide the corresponding sliders rather than
+send values that fail. Measured against `system.ai.claude-sonnet-5-5`:
+
+| Rejected by the gateway (dropped) | Accepted (kept) |
+|---|---|
+| `temperature` (except exactly `1`), `top_p`, `top_k`, `presence_penalty`, `frequency_penalty`, `logit_bias`, `logprobs`, `seed`, `user`, `parallel_tool_calls`, `response_format` | `max_tokens`, `max_completion_tokens`, `stop`, `n`, `stream`, `stream_options`, `reasoning_effort`, `tools`, `tool_choice`, `system` role |
+
+Tool calling — what MCP depends on — works on Claude in both streaming and non-streaming
+modes. `response_format` is dropped because the gateway reports *"Structured output is not
+supported for this model"* for these Anthropic services, so it could only ever `400`.
+
+If you add a model service that **does** support sampling (`llama-4-maverick`,
+`gemini-*`), give it its own `custom` endpoint rather than widening this list, since
+`dropParams` is per-endpoint and would needlessly strip controls that model supports.
+
 ### MCP Services (`catalog.schema.mcp_service_name`)
 
 ```

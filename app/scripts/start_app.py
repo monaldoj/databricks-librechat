@@ -124,6 +124,44 @@ DEFAULT_MCP_SERVICES = "system.ai.dbsql,system.ai.genie_one_mcp,system.ai.web_se
 # cheapest capable model rather than whatever the user picked for chat.
 DEFAULT_TITLE_MODEL = "system.ai.claude-haiku-5-5"
 
+# Sampling parameters that Unity Gateway's Anthropic (`system.ai.claude-*`)
+# model services reject with a 400, and that LibreChat would otherwise send on
+# every request -- its conversation schema defaults `temperature: 1`,
+# `top_p: 1`, `presence_penalty: 0` and `frequency_penalty: 0` even when the
+# user never opens the parameters panel. LibreChat already strips these for
+# model names matching /\b(o[13]|gpt-5)(?!\.|-chat)(?:-|$)/, which is why the
+# GPT services work and `claude-*` does not; `dropParams` extends the same
+# stripping to a non-OpenAI provider.
+#
+# Both the camelCase and snake_case spelling of each parameter is listed:
+# LibreChat keeps `knownOpenAIParams` camelCased on `llmConfig` and passes
+# anything else through to `modelKwargs` in snake_case, and `deleteConfigParam`
+# literally deletes the key from both. Non-matching entries are no-ops.
+#
+# Every entry here was confirmed to return 400 from
+# POST /ai-gateway/mlflow/v1/chat/completions for system.ai.claude-sonnet-5-5.
+# Keep this in sync with the `dropParams` block in app/librechat.yaml.
+UNITY_GATEWAY_DROP_PARAMS = (
+    "temperature",
+    "topP",
+    "top_p",
+    "topK",
+    "top_k",
+    "frequencyPenalty",
+    "frequency_penalty",
+    "presencePenalty",
+    "presence_penalty",
+    "logitBias",
+    "logit_bias",
+    "logprobs",
+    "topLogprobs",
+    "top_logprobs",
+    "seed",
+    "user",
+    "parallel_tool_calls",
+    "response_format",
+)
+
 EMBEDDED_MONGO_URI = "mongodb://127.0.0.1:27017/LibreChat"
 _LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1", "[::1]", "0.0.0.0"}
 
@@ -528,6 +566,17 @@ def render_librechat_yaml() -> Path:
         ugw_endpoint["titleModel"] = (
             os.environ.get("UNITY_GATEWAY_TITLE_MODEL") or DEFAULT_TITLE_MODEL
         ).strip()
+
+        # Without this, every `system.ai.claude-*` call 400s because LibreChat
+        # sends OpenAI sampling defaults the Anthropic services reject. The
+        # template declares the same list; union them so the guarantee does not
+        # depend on the template, while still honouring anything extra an
+        # operator added there.
+        declared = [p for p in (ugw_endpoint.get("dropParams") or []) if p]
+        for param in UNITY_GATEWAY_DROP_PARAMS:
+            if param not in declared:
+                declared.append(param)
+        ugw_endpoint["dropParams"] = declared
 
     # 2. Allow the workspace host through LibreChat's SSRF guard.
     #
