@@ -299,6 +299,52 @@ orchestrator verifies it resolves and installs it explicitly if not, rather than
 The downloaded `mongod` binary is cached to the UC Volume so later cold starts don't need
 `fastdl.mongodb.org`.
 
+### 3a. Single sign-on: why the proxy holds the LibreChat session
+
+**Databricks Apps terminates `Authorization` itself and never forwards it to the app.**
+Verified against the running app:
+
+| Request to the app URL | Response | Meaning |
+|---|---|---|
+| Valid Databricks token in `Authorization` | `401 {"message":"No auth token"}` | Reached LibreChat, which saw **no** auth header — the platform stripped it |
+| Garbage bearer | `401 {}` | Platform-generated — the platform validates and consumes the header |
+
+LibreChat's `jwtStrategy` reads auth *only* from `Authorization: Bearer`
+(`ExtractJwt.fromAuthHeaderAsBearerToken()`), so a browser can **never** authenticate to
+LibreChat through Databricks Apps. Cookie-based `/api/auth/refresh` succeeds, every
+`Authorization`-based route returns `401 {"message":"No auth token"}` (27 bytes), and the UI
+falls back to its "create an account" screen.
+
+So the ingress proxy holds the session instead. For every `/api/*` request (except
+`/api/auth/*`) it attaches `Authorization: Bearer <librechat-jwt>` for the user named by the
+proxy-verified `x-forwarded-email`, provisioning the account on first use. The browser never
+holds a credential, and the Databricks identity *is* the LibreChat session — which is both
+the SSO behaviour and a stronger trust model than a client-held token.
+
+Four things this has to get right:
+
+- **Single-flight.** A cold page load fans out ~15 parallel API calls. Each would otherwise
+  drive its own register+login and trip LibreChat's limiters. Logins are de-duplicated per
+  email behind an `asyncio.Lock`, so a 15-way fan-out performs exactly **one** login.
+- **Rate limits.** `LOGIN_MAX` (default 7 / 5 min) and `REGISTER_MAX` (default 5 / 60 min)
+  are **per IP**, and every login originates from the proxy at `127.0.0.1` — so all users
+  share one bucket and the defaults lock out the 6th person to sign in. Both ceilings are
+  raised. Only the proxy can reach these routes, and it rejects a registration whose email
+  does not match the verified identity.
+- **A stable password secret.** Each user's LibreChat password is derived via HMAC from
+  `LIBRECHAT_SSO_PASSWORD_SECRET`, else the platform-injected `DATABRICKS_CLIENT_SECRET` —
+  **never** the per-boot `JWT_SECRET`. Keying it to a per-boot value would be invisible with
+  an ephemeral MongoDB (both reset together) but would permanently lock every existing user
+  out after a restart once `MONGO_URI` is external.
+- **Display names.** LibreChat requires `name` to be >= 3 characters. The IdP's
+  `x-forwarded-user` is an opaque numeric id, so `x-forwarded-preferred-username` is
+  preferred, falling back to a humanized email local part
+  (`justin.monaldo` -> `Justin Monaldo`). `ALLOW_UNVERIFIED_EMAIL_LOGIN=true` is set because
+  this container can never send a verification mail.
+
+Session expiry is invisible: a 401 on an injected request mints a fresh token and retries
+once, and concurrent 401s collapse into a single re-login.
+
 ### 4. On-Behalf-Of authentication, failing closed
 
 Databricks Apps forwards the signed-in user's token as `x-forwarded-access-token`.
@@ -371,6 +417,17 @@ initialize:
 | `endpoints.allowedAddresses` | `<host>:443` | Same, for the Unity Gateway model endpoint |
 
 Re-rendering is idempotent, so these never accumulate duplicates.
+
+## Gotchas worth knowing
+
+- **`sys.executable` is relative.** The Apps runtime launches the app as `.venv/bin/python`,
+  so `sys.executable` only resolves against the startup working directory. Child processes
+  spawned with `cwd=` elsewhere fail with
+  `[Errno 2] No such file or directory: '.venv/bin/python'` — which is how the RAG API
+  silently degraded to `rag_api: warning`. `PYTHON_EXECUTABLE` is resolved once at import,
+  while the cwd is still the app root, and used for every child process.
+- **Check `/api/databricks/health` first.** It reports Lakebase, MongoDB, RAG API and OBO
+  state in one place, and surfaces partial failures (like the one above) that the UI hides.
 
 ## Known limitations
 

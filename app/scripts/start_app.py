@@ -63,6 +63,7 @@ except ModuleNotFoundError as _exc:  # pragma: no cover - startup diagnostics on
                 f"FATAL: could not import a required package: {_exc.name}",
                 "=" * 78,
                 f"  interpreter : {sys.executable}",
+                f"  resolved    : {Path(sys.executable).resolve()}",
                 f"  version     : {sys.version.split()[0]}",
                 f"  sys.prefix  : {sys.prefix}",
                 f"  base_prefix : {sys.base_prefix}",
@@ -88,6 +89,14 @@ logging.basicConfig(
 logger = logging.getLogger("databricks-librechat")
 
 APP_ROOT = Path(__file__).resolve().parent.parent
+
+# The Databricks Apps runtime launches the app with a RELATIVE interpreter path
+# (`.venv/bin/python`), so `sys.executable` only resolves against the startup
+# working directory. Child processes are spawned with `cwd=` elsewhere, where it
+# fails with:
+#     [Errno 2] No such file or directory: '.venv/bin/python'
+# Resolve it once, at import, while the cwd is still the app root.
+PYTHON_EXECUTABLE = str(Path(sys.executable).resolve())
 SCRIPTS_DIR = APP_ROOT / "scripts"
 
 INGRESS_PORT = int(os.environ.get("DATABRICKS_APP_PORT") or os.environ.get("PORT") or "8000")
@@ -200,6 +209,14 @@ class AppState:
         # the build and the LibreChat server share one Node version.
         self.node_env: Dict[str, str] = {}
 
+        # LibreChat session JWTs, keyed by Databricks-verified email. The
+        # Databricks Apps proxy consumes the `Authorization` header and never
+        # forwards it, so the browser cannot carry a LibreChat bearer token --
+        # the ingress proxy must attach one server-side. See
+        # `ensure_librechat_token`.
+        self.librechat_tokens_by_email: Dict[str, str] = {}
+        self.librechat_token_lock = threading.Lock()
+
         # OBO token store: email -> access token
         self.obo_tokens_by_email: Dict[str, str] = {}
         self.obo_lock = threading.Lock()
@@ -246,6 +263,18 @@ class AppState:
                 tmp_path.replace(OBO_CACHE_FILE)
             except Exception as exc:
                 logger.debug("Failed writing OBO token cache: %s", exc)
+
+    def get_librechat_token(self, email: str) -> Optional[str]:
+        with self.librechat_token_lock:
+            return self.librechat_tokens_by_email.get(email.strip().lower())
+
+    def set_librechat_token(self, email: str, token: Optional[str]) -> None:
+        key = email.strip().lower()
+        with self.librechat_token_lock:
+            if token:
+                self.librechat_tokens_by_email[key] = token
+            else:
+                self.librechat_tokens_by_email.pop(key, None)
 
     def resolve_obo_token(self, email: Optional[str]) -> tuple[Optional[str], str]:
         """Resolves a token for `email` only -- never another user's token."""
@@ -973,7 +1002,7 @@ def start_rag_api_with_lakebase() -> None:
             )
             run_cmd_logged(
                 [
-                    sys.executable,
+                    PYTHON_EXECUTABLE,
                     "-m",
                     "pip",
                     "install",
@@ -1009,7 +1038,7 @@ def start_rag_api_with_lakebase() -> None:
 
         proc = subprocess.Popen(
             [
-                sys.executable,
+                PYTHON_EXECUTABLE,
                 "-m",
                 "uvicorn",
                 "main:app",
@@ -1098,6 +1127,24 @@ def start_librechat_backend(config_path: Path) -> None:
             # "[schedules] scheduler NOT started". Must be revisited if the
             # instance count is ever raised (which requires an external MongoDB).
             "SCHEDULES_SINGLE_PROCESS": os.environ.get("SCHEDULES_SINGLE_PROCESS", "true"),
+            # LibreChat rate-limits login (LOGIN_MAX, default 7 per 5 min) and
+            # registration (REGISTER_MAX, default 5 per 60 min) PER IP. Every
+            # login here is issued by the ingress proxy from 127.0.0.1 on behalf
+            # of an already-Databricks-authenticated user, so all users share one
+            # bucket and the defaults lock out the 6th person to sign in. The
+            # proxy is the only thing that can reach these routes with a
+            # mismatched email (it rejects those), so raising the ceiling does
+            # not widen the attack surface.
+            # No mail can ever be sent from this container, so an account could
+            # never be verified; without this, login is refused once LibreChat
+            # decides verification is required.
+            "ALLOW_UNVERIFIED_EMAIL_LOGIN": os.environ.get(
+                "ALLOW_UNVERIFIED_EMAIL_LOGIN", "true"
+            ),
+            "LOGIN_MAX": os.environ.get("LOGIN_MAX", "200"),
+            "LOGIN_WINDOW": os.environ.get("LOGIN_WINDOW", "5"),
+            "REGISTER_MAX": os.environ.get("REGISTER_MAX", "200"),
+            "REGISTER_WINDOW": os.environ.get("REGISTER_WINDOW", "60"),
         }
     )
 
@@ -1153,9 +1200,36 @@ def bootstrap_worker() -> None:
 # =============================================================================
 # 4. Seamless Databricks SSO User Provisioning for Ephemeral MongoDB
 # =============================================================================
+def sso_password_secret() -> str:
+    """
+    The key used to derive each SSO user's LibreChat password.
+
+    It MUST be stable across app restarts. `JWT_SECRET` is regenerated on every
+    boot, so using it would mean the account registered on one boot cannot be
+    logged into on the next -- harmless while MongoDB is ephemeral (both reset
+    together) but a permanent lockout once MONGO_URI points at an external,
+    durable MongoDB.
+
+    `DATABRICKS_CLIENT_SECRET` is injected by the platform, stable for the
+    lifetime of the app's service principal, and not guessable by callers.
+    """
+    explicit = (os.environ.get("LIBRECHAT_SSO_PASSWORD_SECRET") or "").strip()
+    if explicit:
+        return explicit
+    sp_secret = (os.environ.get("DATABRICKS_CLIENT_SECRET") or "").strip()
+    if sp_secret:
+        return sp_secret
+    logger.warning(
+        "Neither LIBRECHAT_SSO_PASSWORD_SECRET nor DATABRICKS_CLIENT_SECRET is set; "
+        "falling back to the per-boot JWT_SECRET. SSO auto-login will stop working "
+        "after a restart if MongoDB is durable."
+    )
+    return JWT_SECRET
+
+
 def derive_sso_password(email: str) -> str:
     digest = hmac.new(
-        JWT_SECRET.encode("utf-8"),
+        sso_password_secret().encode("utf-8"),
         f"databricks-sso:{email.lower()}".encode("utf-8"),
         hashlib.sha256,
     ).hexdigest()
@@ -1177,8 +1251,21 @@ async def auto_login_databricks_sso_user(
     zero changes to LibreChat's core code.
     """
     clean_email = email.strip().lower()
-    display_name = (username or clean_email.split("@")[0]).strip()
-    safe_username = "".join(c if c.isalnum() or c in "_-" else "_" for c in clean_email.split("@")[0])
+    local_part = clean_email.split("@")[0]
+
+    # LibreChat requires `name` to be >= 3 characters, and the previous code used
+    # `x-forwarded-user` -- the IdP's numeric *user id* -- which both risks being
+    # too short (registration then fails with
+    # `name: String must contain at least 3 character(s)`) and shows a number
+    # instead of a person. Prefer the IdP's preferred username, then a
+    # human-readable form of the email local part.
+    humanized = local_part.replace(".", " ").replace("_", " ").replace("-", " ").strip().title()
+    display_name = next(
+        (c.strip()[:80] for c in (username, humanized, clean_email) if c and len(c.strip()) >= 3),
+        "Databricks User",
+    )
+
+    safe_username = "".join(c if c.isalnum() or c in "_-" else "_" for c in local_part)
     if len(safe_username) < 3:
         safe_username = f"dbx_{safe_username}"
     password = derive_sso_password(clean_email)
@@ -1212,11 +1299,91 @@ async def auto_login_databricks_sso_user(
         if login_resp.status == 200:
             STATE.add_log(f"Auto-authenticated Databricks SSO user into LibreChat: {clean_email}")
             return login_resp
-        await login_resp.read()
+        detail = (await login_resp.read())[:200]
         login_resp.close()
+        STATE.add_log(
+            f"SSO auto-login FAILED for {clean_email} (status {login_resp.status}): {detail!r}. "
+            "If MongoDB is durable and this account predates a change of "
+            "LIBRECHAT_SSO_PASSWORD_SECRET / DATABRICKS_CLIENT_SECRET, its derived password no "
+            "longer matches; reset or remove that LibreChat user."
+        )
     except Exception as exc:
         logger.warning("Databricks SSO auto-login note for %s: %s", clean_email, exc)
     return None
+
+
+# Single-flight state for LibreChat logins. Every proxied `/api/*` request needs
+# a session, so a cold page load fans out ~15 parallel calls. Without
+# de-duplication each would drive its own register+login and trip LibreChat's
+# rate limiters (LOGIN_MAX, REGISTER_MAX), locking the user out entirely.
+_librechat_login_locks: Dict[str, asyncio.Lock] = {}
+_librechat_login_retry_after: Dict[str, float] = {}
+LOGIN_FAILURE_BACKOFF_SEC = 30.0
+
+
+async def ensure_librechat_token(
+    session: aiohttp.ClientSession,
+    email: str,
+    username: Optional[str],
+    obo_headers: Dict[str, str],
+    force_refresh: bool = False,
+    stale_token: Optional[str] = None,
+) -> Optional[str]:
+    """
+    Returns a LibreChat session JWT for the Databricks-verified `email`,
+    provisioning the account on first use.
+
+    This exists because Databricks Apps terminates `Authorization` itself: a
+    request carrying a bearer token is authenticated by the platform and the
+    header is NOT forwarded to the app. LibreChat's `jwtStrategy` reads auth
+    exclusively from `Authorization: Bearer` (`ExtractJwt.fromAuthHeaderAsBearerToken`),
+    so a browser can never authenticate to it through Apps -- every call returns
+    `401 {"message":"No auth token"}`.
+
+    Attaching the token here, keyed off the proxy-verified `x-forwarded-email`,
+    is what makes the app behave like SSO: the Databricks identity *is* the
+    LibreChat session, and the browser never holds a credential.
+    """
+    clean_email = email.strip().lower()
+    if not force_refresh:
+        cached = STATE.get_librechat_token(clean_email)
+        if cached:
+            return cached
+
+    lock = _librechat_login_locks.setdefault(clean_email, asyncio.Lock())
+    async with lock:
+        # Another request may have completed the login while we waited.
+        cached = STATE.get_librechat_token(clean_email)
+        if cached and (not force_refresh or cached != stale_token):
+            return cached
+
+        retry_after = _librechat_login_retry_after.get(clean_email, 0.0)
+        if time.monotonic() < retry_after:
+            # Backing off after a recent failure instead of hammering the
+            # login route and deepening a rate-limit penalty.
+            return None
+
+        login_resp = await auto_login_databricks_sso_user(
+            session, clean_email, username, obo_headers
+        )
+        token = None
+        if login_resp is not None:
+            try:
+                payload = json.loads((await login_resp.read()).decode("utf-8"))
+                token = payload.get("token") if isinstance(payload, dict) else None
+            except Exception as exc:
+                logger.warning("Could not read LibreChat session token for %s: %s", clean_email, exc)
+            finally:
+                login_resp.close()
+
+        STATE.set_librechat_token(clean_email, token)
+        if token:
+            _librechat_login_retry_after.pop(clean_email, None)
+        else:
+            _librechat_login_retry_after[clean_email] = (
+                time.monotonic() + LOGIN_FAILURE_BACKOFF_SEC
+            )
+        return token
 
 
 # =============================================================================
@@ -1383,7 +1550,12 @@ async def handle_ingress_proxy(request: web.Request) -> web.StreamResponse:
         or request.headers.get("x-forwarded-preferred-username")
         or request.headers.get("x-forwarded-user")
     )
-    obo_user = request.headers.get("x-forwarded-user")
+    # `x-forwarded-preferred-username` is the IdP's human-readable user name;
+    # `x-forwarded-user` is its opaque identifier. Use the former for the
+    # LibreChat display name.
+    obo_user = request.headers.get("x-forwarded-preferred-username") or request.headers.get(
+        "x-forwarded-user"
+    )
     STATE.record_obo_token(obo_tok, obo_email)
 
     if request.path == "/api/databricks/health":
@@ -1476,44 +1648,91 @@ async def handle_ingress_proxy(request: web.Request) -> web.StreamResponse:
                 return out
 
         # No valid local session yet in ephemeral MongoDB -> auto-register & login SSO user
-        obo_hdrs = {}
+        refresh_obo_hdrs: Dict[str, str] = {}
         if obo_tok:
-            obo_hdrs["x-forwarded-access-token"] = obo_tok
+            refresh_obo_hdrs["x-forwarded-access-token"] = obo_tok
         if obo_email:
-            obo_hdrs["x-forwarded-email"] = obo_email
-        login_resp = await auto_login_databricks_sso_user(session, obo_email, obo_user, obo_hdrs)
+            refresh_obo_hdrs["x-forwarded-email"] = obo_email
+        login_resp = await auto_login_databricks_sso_user(
+            session, obo_email, obo_user, refresh_obo_hdrs
+        )
         if login_resp is not None:
             try:
                 login_bytes = await login_resp.read()
+                # Cache the same session the browser is handed, so the very next
+                # proxied API call can authenticate without a second login.
+                try:
+                    parsed_login = json.loads(login_bytes.decode("utf-8"))
+                    if isinstance(parsed_login, dict) and parsed_login.get("token"):
+                        STATE.set_librechat_token(obo_email, parsed_login["token"])
+                except Exception:
+                    pass
                 out = web.Response(status=login_resp.status, body=login_bytes)
                 copy_response_headers(login_resp.headers, out)
                 return out
             finally:
                 login_resp.close()
 
-    async with session.request(
-        request.method,
-        target_url,
-        headers=req_headers,
-        data=body,
-        allow_redirects=False,
-    ) as upstream_resp:
-        content_type = upstream_resp.headers.get("Content-Type", "")
-        is_sse = "text/event-stream" in content_type.lower()
+    # Attach the LibreChat session for the Databricks-verified user. The browser
+    # cannot do this itself: Databricks Apps consumes `Authorization` and does
+    # not forward it, so without this every authenticated LibreChat route
+    # answers `401 {"message":"No auth token"}` and the UI falls back to its
+    # login screen. `/api/auth/*` is left alone so LibreChat's own login,
+    # refresh and logout keep working normally.
+    inject_session = bool(obo_email) and request.path.startswith("/api/") and not request.path.startswith(
+        "/api/auth/"
+    )
+    obo_hdrs: Dict[str, str] = {}
+    if obo_tok:
+        obo_hdrs["x-forwarded-access-token"] = obo_tok
+    if obo_email:
+        obo_hdrs["x-forwarded-email"] = obo_email
+    if inject_session:
+        lc_token = await ensure_librechat_token(session, obo_email, obo_user, obo_hdrs)
+        if lc_token:
+            req_headers["Authorization"] = f"Bearer {lc_token}"
 
-        if is_sse:
-            stream_resp = web.StreamResponse(status=upstream_resp.status)
-            copy_response_headers(upstream_resp.headers, stream_resp)
-            await stream_resp.prepare(request)
-            async for chunk in upstream_resp.content.iter_any():
-                await stream_resp.write(chunk)
-            await stream_resp.write_eof()
-            return stream_resp
+    async def forward() -> web.StreamResponse:
+        async with session.request(
+            request.method,
+            target_url,
+            headers=req_headers,
+            data=body,
+            allow_redirects=False,
+        ) as upstream_resp:
+            content_type = upstream_resp.headers.get("Content-Type", "")
+            is_sse = "text/event-stream" in content_type.lower()
 
-        resp_bytes = await upstream_resp.read()
-        out = web.Response(status=upstream_resp.status, body=resp_bytes)
-        copy_response_headers(upstream_resp.headers, out)
-        return out
+            # A 401 on an injected request means the cached session JWT expired
+            # (LibreChat access tokens are short-lived). Mint a new one and
+            # retry exactly once, so expiry is invisible to the user.
+            if upstream_resp.status == 401 and inject_session and not getattr(forward, "_retried", False):
+                forward._retried = True
+                stale = req_headers.get("Authorization", "")[7:] or None
+                fresh = await ensure_librechat_token(
+                    session, obo_email, obo_user, obo_hdrs,
+                    force_refresh=True, stale_token=stale,
+                )
+                if fresh and fresh != req_headers.get("Authorization", "")[7:]:
+                    req_headers["Authorization"] = f"Bearer {fresh}"
+                    STATE.add_log(f"Renewed expired LibreChat session for {obo_email}")
+                    return await forward()
+
+            if is_sse:
+                stream_resp = web.StreamResponse(status=upstream_resp.status)
+                copy_response_headers(upstream_resp.headers, stream_resp)
+                await stream_resp.prepare(request)
+                async for chunk in upstream_resp.content.iter_any():
+                    await stream_resp.write(chunk)
+                await stream_resp.write_eof()
+                return stream_resp
+
+            resp_bytes = await upstream_resp.read()
+            out = web.Response(status=upstream_resp.status, body=resp_bytes)
+            copy_response_headers(upstream_resp.headers, out)
+            return out
+
+    return await forward()
 
 
 async def handle_obo_bridge(request: web.Request) -> web.StreamResponse:
