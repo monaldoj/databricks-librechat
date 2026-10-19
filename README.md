@@ -62,6 +62,7 @@ connection string verbatim. That is the only change needed, and once it is in pl
    |------|-----------|
    | `github.com` | cloning LibreChat and its RAG API |
    | `registry.npmjs.org` | `npm ci` and the frontend build |
+   | `nodejs.org` | a build-capable Node, if the container's own is too old (first cold start only — then cached in the UC Volume) |
    | `fastdl.mongodb.org` | the `mongod` binary (first cold start only — then cached in the UC Volume) |
    | `pypi.org` | the RAG API's Python dependencies |
 
@@ -113,10 +114,46 @@ Python dependencies (`app/requirements.txt`, all pinned, all with 3.11 manylinux
 pre-installs Dash, Streamlit, Gradio, Flask, FastAPI and Shiny, none of which this app uses.
 Note that `psycopg2` is **not** pre-installed and must stay listed.
 
+### Node toolchain
+
+The Databricks Apps image ships **Node v22.16.0 / npm 10.9.2** (verified from app logs,
+2026-10). LibreChat v0.8.8's build toolchain needs newer: `tsdown@0.22.2` declares
+`engines: ^22.18.0 || >=24.0.0`, and `@babel/*@8.0.0-rc.6` wants `^22.18.0 || >=24.11.0`.
+`npm ci` only *warns* about engine mismatches (`npm warn EBADENGINE`) and installs anyway,
+so the failure surfaces later as:
+
+```
+ℹ tsdown v0.22.2 powered by rolldown v1.1.0
+ ERROR  Error: Failed to import module "unrun". Please ensure it is installed.
+npm error workspace librechat-data-provider@0.8.527
+RuntimeError: Command npm run frontend exited with code 1
+```
+
+That is a red herring. `unrun` is an **optional peer dependency** of `tsdown`
+(`"unrun": "*"` in its `peerDependencies`) and appears nowhere in LibreChat's
+`package-lock.json`, so npm is right to skip it. On Node >= 22.18 `tsdown` loads its
+TypeScript config natively and never needs `unrun`; on 22.16 it falls back to it and fails.
+
+So `start_app.py` provisions its own Node before building: if the container's Node already
+satisfies `MIN_BUILD_NODE` it is used as-is, otherwise the pinned official build
+(`PINNED_NODE_VERSION`, currently `v24.22.0` LTS) is downloaded from `nodejs.org`,
+**verified against a pinned SHA-256**, unpacked under `/tmp/node-toolchain`, and cached in
+the UC Volume for later cold starts. That Node is then used for `npm ci`, the frontend build,
+the embedded `mongod`, and the LibreChat server itself, so everything shares one version.
+
+`node_modules` is tagged with the Node version that installed it
+(`/tmp/librechat/.dbx-node-version`); if the build Node changes, dependencies are reinstalled
+rather than reused against a different ABI.
+
+To bump it, change `PINNED_NODE_VERSION` **and** `PINNED_NODE_SHA256` together — the digest
+is enforced, so a stale pair fails the download rather than running unverified code. Get the
+digest from `https://nodejs.org/dist/<version>/SHASUMS256.txt`.
+
 ### Cold starts are slow
 
 LibreChat's `npm ci` plus Vite frontend build runs **in the container on every cold start**.
-Expect roughly 10–25 minutes. Two things make this tolerable:
+Measured on XLARGE, `npm ci` installs 2,988 packages in about 40 seconds; the frontend build
+is the longer phase. Two things keep this tolerable:
 
 - `compute_size: XLARGE` (48 GB / up to 12 vCPU) — `LARGE` is 12 GB / 4 vCPU and will be
   painfully slow, possibly OOM against the 4 GB Node heap cap.

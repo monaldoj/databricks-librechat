@@ -146,6 +146,19 @@ STATE_VOLUME = (os.environ.get("LIBRECHAT_STATE_VOLUME") or "").strip().rstrip("
 MONGO_BIN_DIR = Path(os.environ.get("MONGOMS_DOWNLOAD_DIR", "/tmp/mongodb-binaries"))
 MONGO_BIN_CACHE_NAME = "mongodb-binaries.tar.gz"
 
+# LibreChat v0.8.8's build toolchain needs a newer Node than the Databricks Apps
+# image ships (v22.16.0 as of 2026-10). `tsdown` declares
+# `engines: ^22.18.0 || >=24.0.0` and on an older Node falls back to its OPTIONAL
+# peer dependency `unrun`, which npm correctly never installs -- producing
+# `ERROR Failed to import module "unrun". Please ensure it is installed.`
+# during `npm run build:data-provider`. Node >= 24.11 also clears the
+# `@babel/*@8.0.0-rc.6` engine warnings. So fetch a known-good Node for the build.
+MIN_BUILD_NODE = (22, 18, 0)
+PINNED_NODE_VERSION = "v24.22.0"  # current LTS ("Krypton")
+PINNED_NODE_SHA256 = "cc2f601cee82d9a5a233302fe307abc600727035fd7d2c3a3571755989e95008"
+NODE_TOOLCHAIN_DIR = Path("/tmp/node-toolchain")
+NODE_VERSION_STAMP = Path("/tmp/librechat/.dbx-node-version")
+
 # LibreChat validates MCP server titles against this pattern
 # (packages/data-provider/src/mcp.ts). A title containing parentheses, dots or
 # underscores makes LibreChat reject the entire config and exit at startup.
@@ -182,6 +195,10 @@ class AppState:
 
         self.databricks_host: str = ""
         self.sp_token: str = ""
+
+        # Environment (PATH-adjusted) that every node/npm invocation must use, so
+        # the build and the LibreChat server share one Node version.
+        self.node_env: Dict[str, str] = {}
 
         # OBO token store: email -> access token
         self.obo_tokens_by_email: Dict[str, str] = {}
@@ -522,6 +539,136 @@ def wait_for_tcp_port(host: str, port: int, timeout_sec: float = 120.0) -> bool:
     return False
 
 
+def _node_version_tuple(node_bin: str = "node") -> Optional[tuple]:
+    try:
+        out = subprocess.run([node_bin, "--version"], capture_output=True, text=True, timeout=30)
+        raw = (out.stdout or "").strip().lstrip("v")
+        if not raw:
+            return None
+        return tuple(int(x) for x in raw.split(".")[:3])
+    except Exception:
+        return None
+
+
+def _node_version_tuple_from_env(env: Dict[str, str]) -> Optional[tuple]:
+    node = shutil.which("node", path=env.get("PATH"))
+    return _node_version_tuple(node) if node else None
+
+
+def _download_verified(url: str, dest: Path, sha256: str) -> None:
+    """Downloads `url` to `dest` and refuses to keep it unless the digest matches."""
+    import urllib.request
+
+    digest = hashlib.sha256()
+    with urllib.request.urlopen(url, timeout=600) as resp, open(dest, "wb") as fh:
+        while True:
+            chunk = resp.read(1024 * 256)
+            if not chunk:
+                break
+            digest.update(chunk)
+            fh.write(chunk)
+    actual = digest.hexdigest()
+    if actual != sha256:
+        dest.unlink(missing_ok=True)
+        raise RuntimeError(f"Checksum mismatch for {url}: expected {sha256}, got {actual}")
+
+
+def ensure_build_node(w: Optional[WorkspaceClient] = None) -> Dict[str, str]:
+    """
+    Guarantees a Node new enough to build LibreChat, and returns the environment
+    (with PATH prepended) that every node/npm invocation should use.
+
+    The container's own Node is used when it already satisfies MIN_BUILD_NODE;
+    otherwise a pinned, checksum-verified official build is unpacked under
+    /tmp and cached in the UC Volume so later cold starts skip the download.
+    """
+    env = os.environ.copy()
+    current = _node_version_tuple()
+    if current and current >= MIN_BUILD_NODE:
+        STATE.add_log(f"Container Node v{'.'.join(map(str, current))} satisfies the build toolchain.")
+        return env
+
+    local_node = NODE_TOOLCHAIN_DIR / "bin"
+    if (local_node / "node").exists():
+        have = _node_version_tuple(str(local_node / "node"))
+        if have and have >= MIN_BUILD_NODE:
+            env["PATH"] = f"{local_node}{os.pathsep}{env.get('PATH', '')}"
+            STATE.add_log(f"Using previously provisioned Node v{'.'.join(map(str, have))} from {local_node}")
+            return env
+
+    STATE.phase = f"Provisioning Node {PINNED_NODE_VERSION} for the LibreChat build..."
+    STATE.add_log(
+        f"Container Node v{'.'.join(map(str, current)) if current else 'unknown'} is older than "
+        f"v{'.'.join(map(str, MIN_BUILD_NODE))}, which LibreChat's build toolchain requires. "
+        f"Provisioning Node {PINNED_NODE_VERSION}."
+    )
+
+    tarball_name = f"node-{PINNED_NODE_VERSION}-linux-x64.tar.xz"
+    archive = Path("/tmp") / tarball_name
+    cache_remote = f"{STATE_VOLUME}/{tarball_name}" if STATE_VOLUME else None
+
+    if not archive.exists() and cache_remote and w is not None:
+        try:
+            resp = w.files.download(cache_remote)
+            with open(archive, "wb") as fh:
+                shutil.copyfileobj(resp.contents, fh)
+            STATE.add_log(f"Restored cached Node tarball from {cache_remote}")
+        except Exception as exc:
+            STATE.add_log(f"No cached Node tarball at {cache_remote} ({exc}); downloading from nodejs.org.")
+
+    if not archive.exists():
+        url = f"https://nodejs.org/dist/{PINNED_NODE_VERSION}/{tarball_name}"
+        STATE.add_log(f"Downloading {url}")
+        try:
+            _download_verified(url, archive, PINNED_NODE_SHA256)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Could not provision Node {PINNED_NODE_VERSION}: {exc}. LibreChat's build "
+                "toolchain needs Node >= 22.18 and this container ships an older one. If this "
+                "workspace restricts egress, allowlist nodejs.org and restart the app."
+            ) from exc
+        if cache_remote and w is not None:
+            try:
+                with open(archive, "rb") as fh:
+                    w.files.upload(cache_remote, fh, overwrite=True)
+                STATE.add_log(f"Cached Node tarball to {cache_remote}")
+            except Exception as exc:
+                STATE.add_log(f"Could not cache Node tarball (non-fatal): {exc}")
+
+    # Python's tarfile handles .tar.xz via stdlib lzma, so no external `xz` needed.
+    if NODE_TOOLCHAIN_DIR.exists():
+        shutil.rmtree(NODE_TOOLCHAIN_DIR)
+    NODE_TOOLCHAIN_DIR.mkdir(parents=True, exist_ok=True)
+    import tarfile
+
+    with tarfile.open(archive, "r:xz") as tf:
+        # Strip the single top-level `node-<ver>-linux-x64/` directory.
+        root = f"node-{PINNED_NODE_VERSION}-linux-x64/"
+        members = []
+        for m in tf.getmembers():
+            if not m.name.startswith(root):
+                continue
+            rel = m.name[len(root):]
+            if not rel or rel.startswith("/") or ".." in Path(rel).parts:
+                continue
+            m.name = rel
+            members.append(m)
+        tf.extractall(str(NODE_TOOLCHAIN_DIR), members=members)
+
+    node_bin = NODE_TOOLCHAIN_DIR / "bin" / "node"
+    node_bin.chmod(0o755)
+    npm_bin = NODE_TOOLCHAIN_DIR / "bin" / "npm"
+    if npm_bin.exists():
+        npm_bin.chmod(0o755)
+    resolved = _node_version_tuple(str(node_bin))
+    if not resolved or resolved < MIN_BUILD_NODE:
+        raise RuntimeError(f"Provisioned Node reports {resolved}, which is still too old.")
+
+    env["PATH"] = f"{NODE_TOOLCHAIN_DIR / 'bin'}{os.pathsep}{env.get('PATH', '')}"
+    STATE.add_log(f"Provisioned Node v{'.'.join(map(str, resolved))} at {NODE_TOOLCHAIN_DIR}")
+    return env
+
+
 def preflight_required_tools() -> None:
     """
     Fails fast with an actionable message instead of a confusing stack trace.
@@ -557,6 +704,7 @@ def ensure_mongodb_memory_server() -> None:
     probe = subprocess.run(
         ["node", "-e", "require.resolve('mongodb-memory-server'); console.log('ok')"],
         cwd=str(LIBRECHAT_DIR),
+        env=STATE.node_env or os.environ.copy(),
         capture_output=True,
         text=True,
     )
@@ -567,6 +715,7 @@ def ensure_mongodb_memory_server() -> None:
     run_cmd_logged(
         ["npm", "install", "--no-save", "--no-audit", "mongodb-memory-server@^11"],
         cwd=LIBRECHAT_DIR,
+        env=STATE.node_env or os.environ.copy(),
         prefix="npm-mongodb-memory-server",
     )
 
@@ -610,8 +759,24 @@ def save_mongod_binary_cache(w: WorkspaceClient) -> None:
         STATE.add_log(f"Could not cache mongod binary (non-fatal): {exc}")
 
 
-def ensure_unmodified_librechat_repo() -> None:
+def ensure_unmodified_librechat_repo(node_env: Dict[str, str]) -> None:
     version = os.environ.get("LIBRECHAT_VERSION", "v0.8.8").strip()
+
+    node_ver = _node_version_tuple_from_env(node_env)
+    stamp = ".".join(map(str, node_ver)) if node_ver else "unknown"
+
+    # Native modules and the build toolchain are tied to the Node that installed
+    # them. If that Node changed since the last install, the tree is stale --
+    # discard node_modules so `npm ci` reruns against the current version.
+    if (LIBRECHAT_DIR / "node_modules").exists():
+        previous = NODE_VERSION_STAMP.read_text().strip() if NODE_VERSION_STAMP.exists() else ""
+        if previous != stamp:
+            STATE.add_log(
+                f"node_modules was installed with Node '{previous or 'unknown'}' but the build "
+                f"Node is now '{stamp}'; reinstalling dependencies."
+            )
+            shutil.rmtree(LIBRECHAT_DIR / "node_modules", ignore_errors=True)
+
     if not (LIBRECHAT_DIR / "package.json").exists():
         STATE.phase = f"Cloning unmodified LibreChat ({version}) from GitHub..."
         if LIBRECHAT_DIR.exists():
@@ -633,19 +798,22 @@ def ensure_unmodified_librechat_repo() -> None:
 
     if not (LIBRECHAT_DIR / "node_modules").exists():
         STATE.phase = "Installing LibreChat npm dependencies (npm ci)..."
-        env = os.environ.copy()
-        env["NODE_OPTIONS"] = "--max-old-space-size=4096"
+        env = dict(node_env)
+        env["NODE_OPTIONS"] = "--max-old-space-size=8192"
         run_cmd_logged(
             ["npm", "ci", "--no-audit"],
             cwd=LIBRECHAT_DIR,
             env=env,
             prefix="npm-ci",
         )
+        NODE_VERSION_STAMP.parent.mkdir(parents=True, exist_ok=True)
+        NODE_VERSION_STAMP.write_text(stamp, encoding="utf-8")
 
     if not (LIBRECHAT_DIR / "client" / "dist" / "index.html").exists():
         STATE.phase = "Building unmodified LibreChat frontend & workspace packages..."
-        env = os.environ.copy()
-        env["NODE_OPTIONS"] = "--max-old-space-size=4096"
+        env = dict(node_env)
+        # XLARGE has 48 GB; the Vite client build is the memory-hungry step.
+        env["NODE_OPTIONS"] = "--max-old-space-size=8192"
         run_cmd_logged(
             ["npm", "run", "frontend"],
             cwd=LIBRECHAT_DIR,
@@ -679,7 +847,7 @@ def start_embedded_mongodb(w: WorkspaceClient) -> None:
         STATE.add_log("Embedded MongoDB is already listening on 127.0.0.1:27017")
         return
 
-    env = os.environ.copy()
+    env = dict(STATE.node_env) if STATE.node_env else os.environ.copy()
     proc = subprocess.Popen(
         ["node", str(SCRIPTS_DIR / "start_mongodb.cjs")],
         cwd=str(LIBRECHAT_DIR if LIBRECHAT_DIR.exists() else APP_ROOT),
@@ -813,7 +981,7 @@ def start_librechat_backend(config_path: Path) -> None:
     existing_node_opts = os.environ.get("NODE_OPTIONS", "")
     node_options = f"--max-old-space-size=4096 --require {preload_script} {existing_node_opts}".strip()
 
-    env = os.environ.copy()
+    env = dict(STATE.node_env) if STATE.node_env else os.environ.copy()
     env.update(
         {
             "NODE_ENV": "production",
@@ -893,8 +1061,9 @@ def bootstrap_worker() -> None:
         threading.Thread(target=credential_refresh_loop, daemon=True).start()
 
         preflight_required_tools()
+        STATE.node_env = ensure_build_node(w)
         config_path = render_librechat_yaml()
-        ensure_unmodified_librechat_repo()
+        ensure_unmodified_librechat_repo(STATE.node_env)
         start_embedded_mongodb(w)
         start_rag_api_with_lakebase()
         start_librechat_backend(config_path)
