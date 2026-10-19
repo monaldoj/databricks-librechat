@@ -10,8 +10,12 @@
 # LAKEBASE_ENDPOINT for the attached `postgres` resource, plus DATABRICKS_HOST,
 # DATABRICKS_APP_PORT, DATABRICKS_CLIENT_ID and DATABRICKS_CLIENT_SECRET. None
 # of those need declaring here.
+# Use `python`, NOT `python3`. The Apps runtime installs requirements.txt into
+# its own Python 3.11 virtualenv and puts that interpreter on PATH as `python`;
+# `python3` can resolve to Ubuntu 22.04's system Python 3.10, which has none of
+# those packages and fails with `ModuleNotFoundError: No module named 'aiohttp'`.
 command:
-  - "python3"
+  - "python"
   - "scripts/start_app.py"
 
 env:

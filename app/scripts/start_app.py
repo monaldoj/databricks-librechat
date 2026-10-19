@@ -43,11 +43,43 @@ import urllib.parse
 from pathlib import Path
 from typing import Any, Deque, Dict, List, Optional
 
-import aiohttp
-from aiohttp import web
-import psycopg2
-import yaml
-from databricks.sdk import WorkspaceClient
+try:
+    import aiohttp
+    from aiohttp import web
+    import psycopg2
+    import yaml
+    from databricks.sdk import WorkspaceClient
+except ModuleNotFoundError as _exc:  # pragma: no cover - startup diagnostics only
+    # Almost always an interpreter mismatch rather than a missing requirement:
+    # the Apps runtime installs requirements.txt into its own Python 3.11
+    # virtualenv, exposed on PATH as `python`. Running `python3` instead can
+    # select Ubuntu 22.04's system Python 3.10, which has no site-packages and
+    # fails here on the first third-party import.
+    sys.stderr.write(
+        "\n".join(
+            [
+                "",
+                "=" * 78,
+                f"FATAL: could not import a required package: {_exc.name}",
+                "=" * 78,
+                f"  interpreter : {sys.executable}",
+                f"  version     : {sys.version.split()[0]}",
+                f"  sys.prefix  : {sys.prefix}",
+                f"  base_prefix : {sys.base_prefix}",
+                "",
+                "If sys.prefix == base_prefix, this is NOT running inside the Apps",
+                "virtualenv and will never see requirements.txt. Make sure the `command`",
+                'in app.yaml (and `config.command` in resources/librechat.app.yml) is',
+                '"python" -- not "python3".',
+                "",
+                "Otherwise, confirm the package is listed in app/requirements.txt and that",
+                "the deploy logs show a successful pip install.",
+                "=" * 78,
+                "",
+            ]
+        )
+    )
+    raise
 
 logging.basicConfig(
     level=logging.INFO,

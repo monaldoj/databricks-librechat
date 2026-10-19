@@ -44,8 +44,11 @@ resources:
       # settings as literal values for UI-driven deploys -- bundle variables are
       # NOT interpolated inside app.yaml, so the two must be kept in sync.
       config:
+        # `python`, not `python3` -- see the note in app/app.yaml. The runtime's
+        # 3.11 virtualenv (where requirements.txt is installed) is on PATH as
+        # `python`; `python3` may be the system 3.10 with no site-packages.
         command:
-          - "python3"
+          - "python"
           - "scripts/start_app.py"
         env:
           - name: LIBRECHAT_VERSION

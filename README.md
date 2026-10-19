@@ -91,6 +91,28 @@ While LibreChat is building, the app serves a live status page showing progress 
 MongoDB, the RAG API and Unity Gateway. `GET /api/databricks/health` returns the same state
 as JSON.
 
+### Use `python`, not `python3`
+
+The Apps runtime is **Python 3.11 on Ubuntu 22.04**. It installs `requirements.txt` into its
+own virtualenv and exposes that interpreter on PATH as **`python`**. A command of `python3`
+can instead resolve to Ubuntu's system Python 3.10, which has none of those packages, and the
+app dies on its first third-party import:
+
+```
+ModuleNotFoundError: No module named 'aiohttp'
+```
+
+That error names `aiohttp` only because it is the first third-party import in
+`start_app.py` -- it is an interpreter problem, not a missing requirement.
+`start_app.py` now wraps those imports and prints the interpreter, version, `sys.prefix` and
+`sys.base_prefix` before re-raising, so the cause is obvious. If `sys.prefix ==
+sys.base_prefix`, the app is not running inside the virtualenv.
+
+Python dependencies (`app/requirements.txt`, all pinned, all with 3.11 manylinux wheels):
+`databricks-sdk`, `aiohttp`, `psycopg2-binary`, `PyYAML`, `uvicorn`. The runtime
+pre-installs Dash, Streamlit, Gradio, Flask, FastAPI and Shiny, none of which this app uses.
+Note that `psycopg2` is **not** pre-installed and must stay listed.
+
 ### Cold starts are slow
 
 LibreChat's `npm ci` plus Vite frontend build runs **in the container on every cold start**.
