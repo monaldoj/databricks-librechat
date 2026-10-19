@@ -255,6 +255,16 @@ There is deliberately **no "most recent user" fallback**. If no token resolves, 
 running as the app's service principal with different privileges. Set
 `DATABRICKS_OBO_ALLOW_SP_FALLBACK=true` to accept that downgrade.
 
+> **Do not add IAM scopes to `user_api_scopes`.** `iam.current-user:read` and
+> `iam.access-control:read` are assigned implicitly by the platform and are rejected if you
+> request them:
+> `The specified scope iam.current-user:read is not a valid scope (400 INVALID_PARAMETER_VALUE)`.
+> The caller's identity already arrives on every request as `x-forwarded-email` /
+> `x-forwarded-preferred-username` next to the OBO token. Only service-level scopes belong
+> here — `ai-functions`, `ai-gateway`, `apps`, `files`, `genie`, `model-serving`, `postgres`,
+> `sql`, `vector-search`, `sql:restricted-query`, plus the `catalog.*` / `workspace.workspace`
+> SDK scopes.
+
 One documented exception: embeddings. The RAG API calls Unity Gateway through a loopback
 bridge on `127.0.0.1:3081` and carries no user identity, so **embeddings run as the app's
 service principal and are not user-attributed**.

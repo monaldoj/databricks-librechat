@@ -19,8 +19,17 @@ resources:
       lifecycle:
         started: true
 
-      # User API scopes required for On-Behalf-Of (OBO) authentication
-      # (`x-forwarded-access-token`) to Databricks Unity Gateway Models and MCPs.
+      # Service-level scopes the On-Behalf-Of token (`x-forwarded-access-token`)
+      # is allowed to exercise against Unity Gateway and Lakebase.
+      #
+      # Do NOT list `iam.current-user:read` / `iam.access-control:read` here.
+      # Those are assigned implicitly by the platform and are rejected when
+      # requested explicitly:
+      #   The specified scope iam.current-user:read is not a valid scope
+      #   (400 INVALID_PARAMETER_VALUE)
+      # The caller's identity already arrives on every request as
+      # `x-forwarded-email` / `x-forwarded-preferred-username`, alongside the
+      # OBO token, with no IAM scope required.
       user_api_scopes:
         - ai-gateway
         - model-serving
@@ -29,8 +38,6 @@ resources:
         - files
         - vector-search
         - postgres
-        - iam.current-user:read
-        - iam.access-control:read
 
       # Runtime command + environment. This is the DAB-managed copy, where
       # `${var.*}` is resolved at deploy time. `app/app.yaml` carries the same
