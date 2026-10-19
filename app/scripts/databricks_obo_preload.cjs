@@ -13,8 +13,15 @@
  *    - MCP Services:   `https://<workspace>/ai-gateway/mcp-services/<catalog>.<schema>.<mcp_service>`
  *    across `globalThis.fetch`, `undici` (Agent/Client/ProxyAgent/fetch), and `http`/`https`,
  *    replacing the `Authorization` header with `Bearer <x-forwarded-access-token>` for the
- *    authenticated Databricks user (with fallback to the App Service Principal token during
- *    non-user background/startup checks).
+ *    authenticated Databricks user.
+ *
+ * Fails CLOSED: a token is only ever resolved for the user who made the request.
+ * There is deliberately no "most recent user" fallback -- that would let one
+ * user's prompt be authorized, billed and audited as another user, which defeats
+ * the entire point of per-user Unity Gateway governance. If no token can be
+ * resolved for the caller, the Authorization header is removed so the call fails
+ * visibly with a 401 instead of silently running as the app Service Principal.
+ * Set DATABRICKS_OBO_ALLOW_SP_FALLBACK=true to accept that privilege downgrade.
  */
 
 'use strict';
@@ -27,15 +34,11 @@ const { AsyncLocalStorage } = require('node:async_hooks');
 
 const oboStorage = new AsyncLocalStorage();
 const tokensByEmail = new Map();
-let latestUserContext = {
-  token: null,
-  email: null,
-  user: null,
-  updatedAt: 0,
-};
 
 const OBO_CACHE_FILE = process.env.DATABRICKS_OBO_CACHE_FILE || '/tmp/databricks_obo_tokens.json';
 const SP_TOKEN_FILE = process.env.DATABRICKS_SP_TOKEN_FILE || '/tmp/databricks_sp_token';
+const ALLOW_SP_FALLBACK =
+  String(process.env.DATABRICKS_OBO_ALLOW_SP_FALLBACK || 'false').toLowerCase() === 'true';
 
 function normalizeHost(raw) {
   if (!raw) return '';
@@ -51,21 +54,15 @@ function getDatabricksHost() {
 }
 
 function readSharedOboToken(email) {
+  // Email-scoped only. The shared cache no longer carries a "latest token", so
+  // there is no way for this to hand back a different user's credential.
+  if (!email) return null;
   try {
     if (!fs.existsSync(OBO_CACHE_FILE)) return null;
-    const raw = fs.readFileSync(OBO_CACHE_FILE, 'utf8');
-    const data = JSON.parse(raw);
-    if (email && data.by_email && data.by_email[email.toLowerCase()]) {
-      return {
-        token: data.by_email[email.toLowerCase()],
-        source: `OBO(shared:${email.toLowerCase()})`,
-      };
-    }
-    if (data.latest_token) {
-      return {
-        token: data.latest_token,
-        source: `OBO(shared-latest:${data.latest_email || 'user'})`,
-      };
+    const data = JSON.parse(fs.readFileSync(OBO_CACHE_FILE, 'utf8'));
+    const key = email.toLowerCase();
+    if (data.by_email && data.by_email[key]) {
+      return { token: data.by_email[key], source: `OBO(shared:${key})` };
     }
   } catch (_) {
     // ignore transient file read errors
@@ -86,6 +83,7 @@ function readServicePrincipalFallbackToken() {
 }
 
 function resolveUnityGatewayBearer(explicitEmail) {
+  // 1. The token carried by the in-flight request -- the normal path.
   const store = oboStorage.getStore();
   if (store && store.token) {
     return {
@@ -94,14 +92,13 @@ function resolveUnityGatewayBearer(explicitEmail) {
     };
   }
 
+  // 2. A token cached for THIS caller's verified email, for calls made outside
+  //    the request's async context.
   const emailKey = (explicitEmail || (store && store.email) || '').trim().toLowerCase();
   if (emailKey && !emailKey.includes('{{')) {
     const memToken = tokensByEmail.get(emailKey);
     if (memToken) {
-      return {
-        token: memToken,
-        source: `OBO(user-map:${emailKey})`,
-      };
+      return { token: memToken, source: `OBO(user-map:${emailKey})` };
     }
     const shared = readSharedOboToken(emailKey);
     if (shared && shared.token) {
@@ -109,26 +106,16 @@ function resolveUnityGatewayBearer(explicitEmail) {
     }
   }
 
-  const sharedLatest = readSharedOboToken(null);
-  if (sharedLatest && sharedLatest.token) {
-    return sharedLatest;
+  // 3. Opt-in only: run as the app Service Principal. This is a privilege
+  //    change, not a retry, so it is off by default.
+  if (ALLOW_SP_FALLBACK) {
+    const spToken = readServicePrincipalFallbackToken();
+    if (spToken) {
+      return { token: spToken, source: 'SP-fallback(app-service-principal)' };
+    }
   }
 
-  if (latestUserContext.token) {
-    return {
-      token: latestUserContext.token,
-      source: `OBO(latest-session:${latestUserContext.email || 'user'})`,
-    };
-  }
-
-  const spToken = readServicePrincipalFallbackToken();
-  if (spToken) {
-    return {
-      token: spToken,
-      source: 'SP-fallback(app-service-principal)',
-    };
-  }
-
+  // 4. Fail closed.
   return null;
 }
 
@@ -164,17 +151,10 @@ http.Server.prototype.emit = function patchedHttpEmit(event, req, res) {
       req.headers['x-forwarded-user'];
     const email = typeof rawEmail === 'string' ? rawEmail.trim().toLowerCase() : null;
 
-    if (typeof oboToken === 'string' && oboToken.trim().length > 0) {
-      const cleanToken = oboToken.trim();
-      latestUserContext = {
-        token: cleanToken,
-        email: email || latestUserContext.email,
-        user: req.headers['x-forwarded-user'] || null,
-        updatedAt: Date.now(),
-      };
-      if (email) {
-        tokensByEmail.set(email, cleanToken);
-      }
+    // Only ever cached against a verified email. An unkeyed token would be
+    // indistinguishable from another user's and could not be used safely.
+    if (typeof oboToken === 'string' && oboToken.trim().length > 0 && email) {
+      tokensByEmail.set(email, oboToken.trim());
     }
 
     return oboStorage.run(
@@ -235,14 +215,24 @@ function extractAndRewriteFetchHeaders(initHeaders, fallbackRequestHeaders) {
   }
 
   const resolved = resolveUnityGatewayBearer(explicitEmail);
-  if (resolved && resolved.token) {
-    // Remove any existing case-variant Authorization key
-    for (const key of Object.keys(filtered)) {
-      if (key.toLowerCase() === 'authorization') {
-        delete filtered[key];
-      }
+
+  // Always drop the inbound Authorization header. librechat.yaml sets it to
+  // `Bearer ${DATABRICKS_TOKEN}` (the app Service Principal), so leaving it in
+  // place when no user token resolved would quietly run the call with the SP's
+  // privileges instead of the caller's.
+  for (const key of Object.keys(filtered)) {
+    if (key.toLowerCase() === 'authorization') {
+      delete filtered[key];
     }
+  }
+  if (resolved && resolved.token) {
     filtered['Authorization'] = `Bearer ${resolved.token}`;
+  } else {
+    console.warn(
+      '[UnityGateway-OBO] No per-user OBO token for this request; sending it without an ' +
+        'Authorization header so it fails visibly rather than running as the app service ' +
+        'principal. Set DATABRICKS_OBO_ALLOW_SP_FALLBACK=true to allow that fallback.',
+    );
   }
 
   return { headers: filtered, resolved };

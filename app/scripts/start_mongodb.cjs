@@ -1,11 +1,22 @@
 /**
  * Embedded Ephemeral MongoDB Launcher for Databricks Apps
  *
- * Uses `mongodb-memory-server` (already installed in LibreChat's node_modules)
- * to run a standalone `mongod` process on 127.0.0.1:27017 backed by an
- * ephemeral directory (/tmp/librechat-mongodb) inside the Databricks App compute.
+ * Uses `mongodb-memory-server` to run a standalone `mongod` process on
+ * 127.0.0.1:27017 backed by an ephemeral directory (/tmp/librechat-mongodb)
+ * inside the Databricks App compute.
  *
- * From LibreChat's perspective, only MONGO_URI=mongodb://127.0.0.1:27017/LibreChat changes.
+ * `mongodb-memory-server` is only a devDependency of LibreChat's `api`
+ * workspace, so it is present solely because `npm ci` installs
+ * devDependencies. `start_app.py` verifies it resolves and installs it
+ * explicitly if not, rather than assuming.
+ *
+ * On first run the mongod binary is downloaded from fastdl.mongodb.org, which
+ * an egress-restricted workspace may block; `start_app.py` caches it in a UC
+ * Volume so later cold starts do not need that download.
+ *
+ * From LibreChat's perspective, only MONGO_URI=mongodb://127.0.0.1:27017/LibreChat
+ * changes. This store is EPHEMERAL: everything in it is lost when the app
+ * restarts. Set MONGO_URI to an external MongoDB for durable history.
  */
 
 const fs = require('node:fs');

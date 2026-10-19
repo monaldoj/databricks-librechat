@@ -11,8 +11,8 @@ variables:
     default: "librechat-app"
 
   app_compute_size:
-    description: "Compute size for the Databricks App (MEDIUM or LARGE)"
-    default: "LARGE"
+    description: "Compute size for the Databricks App (MEDIUM, LARGE, or XLARGE). LibreChat's npm install + Vite frontend build runs in-container on cold start, so XLARGE (48 GB / up to 12 vCPU) is the practical minimum."
+    default: "XLARGE"
 
   lakebase_project_id:
     description: "Lakebase Autoscaling PostgreSQL project ID (1-63 lowercase alphanumeric/hyphens)"
@@ -23,28 +23,62 @@ variables:
     default: "LibreChat Lakebase Autoscaling"
 
   lakebase_branch:
-    description: "Lakebase branch name (default branch created with project is 'production')"
+    description: "Lakebase branch ID (the default branch created with a project is 'production')"
     default: "production"
 
-  lakebase_database:
-    description: "Lakebase PostgreSQL database name (default created with project is 'databricks_postgres')"
-    default: "databricks_postgres"
+  # NOTE: this is the Lakebase *resource* ID, which is hyphenated, e.g.
+  #   projects/<p>/branches/<b>/databases/databricks-postgres
+  # It is NOT the PostgreSQL database name (`databricks_postgres`, with an
+  # underscore), which the platform injects into the app as PGDATABASE.
+  # Verify with: databricks postgres list-databases projects/<p>/branches/<b>
+  lakebase_database_id:
+    description: "Lakebase database resource ID used in the app's postgres binding (hyphenated, e.g. databricks-postgres)"
+    default: "databricks-postgres"
 
   librechat_version:
     description: "Upstream LibreChat git tag/branch to run unmodified from https://github.com/LibreChat-AI/LibreChat"
     default: "v0.8.8"
 
+  # A loopback host (the default) means "run the ephemeral MongoDB embedded in
+  # this app container" -- convenient, but ALL LibreChat state is lost whenever
+  # the app restarts. Point this at a managed MongoDB (Atlas, DocumentDB, ...)
+  # for durable chat history; the embedded mongod is then never started and
+  # `compute_max_instances` can safely be raised above 1.
+  mongo_uri:
+    description: "MongoDB connection string. A loopback host means use the ephemeral MongoDB embedded in the app container; any other host is treated as external and durable."
+    default: "mongodb://127.0.0.1:27017/LibreChat"
+
+  prod_root_path:
+    description: "Workspace root path for the prod target. Override with a service-principal path for CI-driven production deploys."
+    default: /Workspace/Users/${workspace.current_user.userName}/.bundle/${bundle.name}/prod
+
+  state_catalog:
+    description: "Unity Catalog catalog holding the app's state volume"
+    default: "justinm_demo"
+
+  state_schema:
+    description: "Unity Catalog schema holding the app's state volume"
+    default: "librechat"
+
+  state_volume:
+    description: "UC Volume used to cache the mongod binary so cold starts do not depend on egress to fastdl.mongodb.org"
+    default: "app_state"
+
   unity_gateway_default_model:
     description: "Default 3-level namespace model service in Unity Gateway (catalog.schema.model_service_name)"
-    default: "system.ai.claude-sonnet-4-5"
+    default: "system.ai.claude-sonnet-5-5"
 
   unity_gateway_models:
     description: "Comma-separated list of 3-level namespace model services in Unity Gateway (catalog.schema.model_service_name)"
-    default: "system.ai.claude-sonnet-4-5,system.ai.claude-opus-4-5,system.ai.gpt-5-6-sol"
+    default: "system.ai.claude-opus-5-5,system.ai.claude-sonnet-5-5,system.ai.claude-haiku-5-5,system.ai.gpt-5-6-sol"
 
   unity_gateway_embedding_model:
-    description: "3-level namespace embedding model service in Unity Gateway used by LibreChat RAG API + Lakebase pgvector"
-    default: "system.ai.databricks-gte-large-en"
+    description: "3-level namespace embedding model service used by LibreChat's RAG API + Lakebase pgvector"
+    default: "system.ai.gte-large-en"
+
+  unity_gateway_title_model:
+    description: "3-level namespace model service used to generate conversation titles. Titles are generated on every new chat, so default to a cheap model."
+    default: "system.ai.claude-haiku-5-5"
 
   unity_gateway_mcp_services:
     description: "Comma-separated list of 3-level namespace MCP services in Unity Gateway (catalog.schema.mcp_service_name)"
@@ -60,6 +94,15 @@ targets:
 
   prod:
     mode: production
+    # Pinned so prod always deploys to one well-known location instead of
+    # landing under whichever operator happens to run the deploy. For a real
+    # production rollout, override `prod_root_path` with a service-principal
+    # path and deploy as that service principal from CI:
+    #   --var="prod_root_path=/Workspace/Users/<sp-application-id>/.bundle/databricks-librechat/prod"
+    # Do NOT point this at /Workspace/Shared -- that is writable by every
+    # workspace user.
+    workspace:
+      root_path: ${var.prod_root_path}
     variables:
       app_name: "librechat"
       lakebase_project_id: "librechat-lakebase"

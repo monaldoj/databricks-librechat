@@ -1,0 +1,9 @@
+resources:
+  # Unity Catalog home for the app's cached runtime artifacts. LibreChat's own
+  # state lives in MongoDB (see README -- it is ephemeral until MONGO_URI points
+  # at an external MongoDB).
+  schemas:
+    librechat_state_schema:
+      catalog_name: ${var.state_catalog}
+      name: ${var.state_schema}
+      comment: "State and cached runtime artifacts for the LibreChat Databricks App"

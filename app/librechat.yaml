@@ -5,7 +5,19 @@
 # - Unity Gateway Overview: https://docs.databricks.com/aws/en/ai-gateway/
 # - Query 3-level Model Services: https://docs.databricks.com/aws/en/ai-gateway/query-model-services
 # - Query 3-level MCP Services: https://docs.databricks.com/aws/en/agents/mcp-tools/
-version: 1.3.6
+#
+# This file is a TEMPLATE. `scripts/start_app.py` renders it to
+# /tmp/librechat.yaml with the live workspace host and the model / MCP services
+# named by the UNITY_GATEWAY_* environment variables, then points LibreChat at
+# it via CONFIG_PATH. LibreChat itself is run unmodified.
+#
+# IMPORTANT -- MCP `title` is validated by LibreChat against
+#   ^[\p{L}\p{N}][\p{L}\p{N}\p{M}'’ -]*$
+# (packages/data-provider/src/mcp.ts). Letters, digits, spaces, hyphens and
+# apostrophes only: no parentheses, dots or underscores. A title that fails this
+# regex makes LibreChat reject the whole config and exit at startup, so the
+# three-level service name belongs in `description`, never in `title`.
+version: 1.3.17
 cache: true
 
 interface:
@@ -25,7 +37,8 @@ interface:
 registration:
   socialLogins: []
 
-# Allow local OBO gateway loopback if needed alongside direct Unity Gateway host
+# SSRF exemption for the loopback Unity Gateway OBO bridge that the RAG API
+# calls for embeddings (see scripts/start_app.py `handle_obo_bridge`).
 mcpSettings:
   allowedAddresses:
     - "127.0.0.1:3081"
@@ -33,15 +46,17 @@ mcpSettings:
 # =============================================================================
 # Databricks Unity Gateway MCP Services (catalog.schema.mcp_service_name)
 # =============================================================================
-# Using {{LIBRECHAT_USER_EMAIL}} in headers instructs LibreChat to create
-# user-scoped MCP connections and pass the caller's identity on every tool
-# discovery and tool call so the OBO preload hook injects the user's
-# `x-forwarded-access-token` from Databricks Apps.
+# Verified URL shape (returns a valid MCP `initialize` handshake):
+#   POST https://<workspace-host>/ai-gateway/mcp-services/<catalog>.<schema>.<name>
+#
+# `startup: false` keeps these out of app-level shared connections so each
+# connection is created per user, and the OBO preload hook injects that user's
+# `x-forwarded-access-token`.
 mcpServers:
   "system.ai.dbsql":
     type: streamable-http
-    title: "Databricks SQL (system.ai.dbsql)"
-    description: "Execute governed SQL queries and explore schemas via Unity Gateway"
+    title: "Databricks SQL"
+    description: "Execute governed SQL queries and explore schemas via Unity Gateway (system.ai.dbsql)"
     url: "https://${DATABRICKS_HOST}/ai-gateway/mcp-services/system.ai.dbsql"
     timeout: 120000
     initTimeout: 30000
@@ -54,8 +69,8 @@ mcpServers:
 
   "system.ai.genie_one_mcp":
     type: streamable-http
-    title: "Databricks Genie One (system.ai.genie_one_mcp)"
-    description: "Natural-language business analytics grounded in Genie Ontology via Unity Gateway"
+    title: "Databricks Genie One"
+    description: "Natural-language business analytics grounded in Genie Ontology via Unity Gateway (system.ai.genie_one_mcp)"
     url: "https://${DATABRICKS_HOST}/ai-gateway/mcp-services/system.ai.genie_one_mcp"
     timeout: 120000
     initTimeout: 30000
@@ -68,8 +83,8 @@ mcpServers:
 
   "system.ai.web_search":
     type: streamable-http
-    title: "Databricks Web Search (system.ai.web_search)"
-    description: "Governed web search through Databricks Unity Gateway"
+    title: "Databricks Web Search"
+    description: "Governed web search through Databricks Unity Gateway (system.ai.web_search)"
     url: "https://${DATABRICKS_HOST}/ai-gateway/mcp-services/system.ai.web_search"
     timeout: 60000
     initTimeout: 30000
@@ -83,6 +98,8 @@ mcpServers:
 # =============================================================================
 # Databricks Unity Gateway Model Services (catalog.schema.model_service_name)
 # =============================================================================
+# Verified: POST https://<host>/ai-gateway/mlflow/v1/chat/completions with
+# {"model": "system.ai.claude-sonnet-5-5", ...} returns an OpenAI-shaped 200.
 endpoints:
   allowedAddresses:
     - "127.0.0.1:3081"
@@ -96,12 +113,13 @@ endpoints:
         x-librechat-user-id: "{{LIBRECHAT_USER_ID}}"
       models:
         default:
-          - "system.ai.claude-sonnet-4-5"
-          - "system.ai.claude-opus-4-5"
+          - "system.ai.claude-opus-5-5"
+          - "system.ai.claude-sonnet-5-5"
+          - "system.ai.claude-haiku-5-5"
           - "system.ai.gpt-5-6-sol"
         fetch: false
       titleConvo: true
-      titleModel: "system.ai.claude-sonnet-4-5"
+      titleModel: "system.ai.claude-haiku-5-5"
       summarize: false
       forcePrompt: false
       modelDisplayLabel: "Unity Gateway"

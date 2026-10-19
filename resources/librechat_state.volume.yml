@@ -1,0 +1,10 @@
+resources:
+  # Caches the mongod binary so a cold start does not have to re-download it
+  # from fastdl.mongodb.org (which egress-restricted workspaces may block).
+  volumes:
+    librechat_state_volume:
+      catalog_name: ${var.state_catalog}
+      schema_name: ${resources.schemas.librechat_state_schema.name}
+      name: ${var.state_volume}
+      volume_type: MANAGED
+      comment: "Cached mongod binary for the LibreChat Databricks App"

@@ -1,227 +1,291 @@
 # LibreChat on Databricks Apps (DAB)
 
-Deploy an **unmodified** instance of [LibreChat](https://github.com/LibreChat-AI/LibreChat) as a **Databricks App** using a **Databricks Asset Bundle (DAB)**, wired out of the box to:
+Run an **unmodified** [LibreChat](https://github.com/LibreChat-AI/LibreChat) as the front end
+for an enterprise chatbot on **Databricks Apps**, deployed with a **Declarative Automation
+Bundle (DAB)**, wired to:
 
-1. **Lakebase Autoscaling (PostgreSQL 17 + `pgvector`)** for LibreChat's persistent PostgreSQL / RAG storage — changing only the PostgreSQL connection string from LibreChat's perspective.
-2. **Embedded Ephemeral MongoDB** running inside the same Databricks App compute (`MONGO_URI=mongodb://127.0.0.1:27017/LibreChat`) — changing only the MongoDB connection string from LibreChat's perspective.
-3. **[Databricks Unity Gateway](https://docs.databricks.com/aws/en/ai-gateway/)** for both **Model Services** and **MCP Services** addressed via three-level Unity Catalog namespaces (`catalog.schema.service_name`), using **On-Behalf-Of (OBO)** user authentication (`x-forwarded-access-token`) so every model and MCP call inherits the logged-in Databricks user's Unity Catalog permissions, rate limits, guardrails, and audit lineage.
+1. **Databricks Unity Gateway** for **Model Services** and **MCP Services** addressed by
+   three-level Unity Catalog namespaces (`catalog.schema.service_name`), using
+   **On-Behalf-Of (OBO)** user authentication so every model and MCP call inherits the
+   signed-in Databricks user's permissions, rate limits, guardrails and audit lineage.
+2. **Lakebase Autoscaling (PostgreSQL 17 + `pgvector`)** for LibreChat's PostgreSQL
+   dependency — the RAG / file-search vector store.
+3. **MongoDB** for LibreChat's own database. By default an **ephemeral** `mongod` runs inside
+   the app container; point `mongo_uri` at a managed MongoDB for durable history.
 
----
-
-## Architecture
-
-```text
-┌───────────────────────────────────────────────────────────────────────────────────┐
-│ Databricks User Browser (SSO Authenticated)                                       │
-└─────────────────────────────────────────┬─────────────────────────────────────────┘
-                                          │ HTTPS
-                                          ▼
-┌───────────────────────────────────────────────────────────────────────────────────┐
-│ Databricks Apps Reverse Proxy                                                     │
-│ Injects: x-forwarded-access-token (OBO user token), x-forwarded-email             │
-└─────────────────────────────────────────┬─────────────────────────────────────────┘
-                                          │
-                                          ▼
-┌───────────────────────────────────────────────────────────────────────────────────┐
-│ Databricks App Compute (LARGE)                                                    │
-│                                                                                   │
-│  ┌─────────────────────────────────────────────────────────────────────────────┐  │
-│  │ 1. Ingress Proxy & Orchestrator (scripts/start_app.py on $DATABRICKS_APP_PORT)│
-│  │    • Captures x-forwarded-access-token & x-forwarded-email per user         │  │
-│  │    • Auto-provisions Databricks SSO user into ephemeral MongoDB             │  │
-│  │    • Mints & refreshes 1-hr Lakebase OAuth credentials (PGSSLMODE=require)  │  │
-│  └──────────────────────────────┬──────────────────────────────────────────────┘  │
-│                                 │ HTTP / SSE / WS (127.0.0.1:3080)                │
-│                                 ▼                                                 │
-│  ┌─────────────────────────────────────────────────────────────────────────────┐  │
-│  │ 2. Unmodified LibreChat (https://github.com/LibreChat-AI/LibreChat)         │  │
-│  │    + NODE_OPTIONS="--require scripts/databricks_obo_preload.cjs"            │  │
-│  │    • Zero code modifications to LibreChat                                   │  │
-│  │    • Preload hook swaps outbound Unity Gateway Authorization header with    │  │
-│  │      the user's OBO Bearer token (x-forwarded-access-token)                 │  │
-│  └──────┬───────────────────────────────┬───────────────────────────────┬──────┘  │
-│         │                               │                               │         │
-│         │ MONGO_URI                     │ RAG_API_URL                   │ HTTPS   │
-│         ▼                               ▼                               │ (OBO)   │
-│  ┌──────────────────────────┐    ┌───────────────────────────────────┐  │         │
-│  │ 3. Embedded MongoDB      │    │ 4. Unmodified LibreChat RAG API   │  │         │
-│  │ 127.0.0.1:27017/LibreChat│    │ 127.0.0.1:8001 (pgvector client)  │  │         │
-│  │ (Ephemeral on app compute│    └─────────────────┬─────────────────┘  │         │
-│  └──────────────────────────┘                      │                    │         │
-└────────────────────────────────────────────────────┼────────────────────┼─────────┘
-                                                     │                    │
-                     DATABASE_URL (sslmode=require)  │                    │
-                     + Lakebase OAuth Token          │                    │
-                                                     ▼                    ▼
-                            ┌──────────────────────────────┐   ┌──────────────────────────────────────────┐
-                            │ Lakebase Autoscaling Project │   │ Databricks Unity Gateway                 │
-                            │ PostgreSQL 17 + pgvector     │   │                                          │
-                            │ • Branch: production         │   │ • Models (/ai-gateway/mlflow/v1):        │
-                            │ • DB: databricks_postgres    │   │   catalog.schema.model_service_name      │
-                            │ • Schema: librechat          │   │   e.g. system.ai.claude-sonnet-4-5       │
-                            └──────────────────────────────┘   │                                          │
-                                                               │ • MCPs (/ai-gateway/mcp-services/...):   │
-                                                               │   catalog.schema.mcp_service_name        │
-                                                               │   e.g. system.ai.dbsql,                  │
-                                                               │        system.ai.genie_one_mcp           │
-                                                               └──────────────────────────────────────────┘
-```
+Nothing in LibreChat's source is modified. All integration happens through environment
+variables, a rendered `librechat.yaml`, and a Node `--require` preload hook.
 
 ---
 
-## Repository Structure
+## Read this before you deploy
 
-```text
-.
-├── databricks.yml                      # Root DAB configuration & customizable variables
-├── resources/
-│   ├── lakebase.postgres.yml           # Lakebase Autoscaling Postgres 17 project & branch
-│   └── librechat.app.yml               # Databricks App resource, OBO scopes, and Lakebase binding
-└── app/
-    ├── app.yaml                        # Databricks App runtime command & environment variables
-    ├── librechat.yaml                  # LibreChat config for Unity Gateway 3-level Models & MCPs
-    ├── requirements.txt                # Python dependencies for orchestrator & Lakebase setup
-    └── scripts/
-        ├── start_app.py                # App entrypoint: Lakebase auth, MongoDB, RAG API, LibreChat & OBO proxy
-        ├── start_mongodb.cjs           # Embedded ephemeral MongoDB launcher (127.0.0.1:27017)
-        └── databricks_obo_preload.cjs  # Node preload hook injecting OBO tokens on Unity Gateway calls
+**LibreChat cannot use PostgreSQL as its primary database.** LibreChat v0.8.8 is
+mongoose/MongoDB-only — there is no `postgres`, `drizzle`, `prisma` or `sequelize` code
+anywhere in the repository. So Lakebase serves LibreChat's *one* PostgreSQL dependency, the
+RAG API's `pgvector` store. Making Lakebase the primary store would mean forking LibreChat's
+data layer, which defeats the "run it unmodified" goal.
+
+**What that means for your data, with the default `mongo_uri`:**
+
+| Data | Where it lives | Survives an app restart? |
+|------|----------------|--------------------------|
+| Conversations, users, agents, prompts, presets, files metadata | Embedded MongoDB (`/tmp`) | **No** |
+| RAG / file-search embeddings | Lakebase PostgreSQL + `pgvector` | Yes |
+
+Set the `mongo_uri` variable to an external managed MongoDB to make everything durable:
+
+```bash
+databricks bundle deploy -t prod -p <profile> \
+  --var="mongo_uri=mongodb+srv://<user>:<pw>@<cluster>.mongodb.net/LibreChat?retryWrites=true"
 ```
+
+The app detects a non-loopback host, skips the embedded `mongod` entirely, and uses your
+connection string verbatim. That is the only change needed, and once it is in place
+`compute_max_instances` can safely be raised above 1.
 
 ---
 
 ## Prerequisites
 
-1. **Databricks CLI** (`v0.250.0+` or `v1.x` with Lakebase & Apps bundle support) installed and authenticated:
+1. **Databricks CLI v1.20.0+**, authenticated:
    ```bash
    databricks --version
    databricks auth profiles
    ```
-2. A Databricks workspace with:
-   - **Databricks Apps** enabled
-   - **Lakebase Autoscaling** enabled
-   - **[Unity Gateway](https://docs.databricks.com/aws/en/ai-gateway/)** enabled
+2. A workspace with **Databricks Apps**, **Lakebase Autoscaling** and **Unity Gateway** enabled.
+3. **Outbound network access** from the app container. LibreChat is cloned and built at
+   startup, so in an egress-restricted workspace these must be allowlisted in the egress
+   policy — and the app **restarted afterwards**, since egress changes need a restart:
+
+   | Host | Needed for |
+   |------|-----------|
+   | `github.com` | cloning LibreChat and its RAG API |
+   | `registry.npmjs.org` | `npm ci` and the frontend build |
+   | `fastdl.mongodb.org` | the `mongod` binary (first cold start only — then cached in the UC Volume) |
+   | `pypi.org` | the RAG API's Python dependencies |
+
+4. Permission to create a schema and volume in the catalog named by `state_catalog`
+   (default `justinm_demo`).
 
 ---
 
 ## Quickstart
 
-### 1. Validate the Bundle
-
 ```bash
-databricks bundle validate -p <your-databricks-profile>
+# 1. Validate
+databricks bundle validate --strict -t dev -p <profile>
+
+# 2. Deploy and start (this creates the app, Lakebase project, schema and volume)
+databricks bundle deploy -t dev -p <profile>
+
+# 3. Watch it come up — the first boot builds LibreChat from source
+databricks apps logs librechat-dev --follow -p <profile>
 ```
 
-### 2. Deploy the Lakebase Project and Databricks App
+`lifecycle.started: true` is set on the app, so `bundle deploy` brings up compute and
+returns a URL; you do not need a separate `bundle run`. (`databricks apps logs` requires
+OAuth auth, not a PAT.)
 
-```bash
-databricks bundle deploy -p <your-databricks-profile>
-```
+While LibreChat is building, the app serves a live status page showing progress for Lakebase,
+MongoDB, the RAG API and Unity Gateway. `GET /api/databricks/health` returns the same state
+as JSON.
 
-This provisions:
-- A **Lakebase Autoscaling PostgreSQL 17 project** (`librechat-lakebase-dev` in `dev` target or `librechat-lakebase` in `prod` target) with its default `production` branch and `databricks_postgres` database.
-- A **Databricks App** (`librechat-dev` in `dev` or `librechat` in `prod`) with `CAN_CONNECT_AND_CREATE` permission on the Lakebase database and On-Behalf-Of `user_api_scopes` (`ai-gateway`, `model-serving`, `sql`, `genie`, `files`, `vector-search`, `postgres`, `iam.current-user:read`, `iam.access-control:read`).
+### Cold starts are slow
 
-### 3. Run / Start the Databricks App
+LibreChat's `npm ci` plus Vite frontend build runs **in the container on every cold start**.
+Expect roughly 10–25 minutes. Two things make this tolerable:
 
-```bash
-databricks bundle run librechat_app -p <your-databricks-profile>
-```
+- `compute_size: XLARGE` (48 GB / up to 12 vCPU) — `LARGE` is 12 GB / 4 vCPU and will be
+  painfully slow, possibly OOM against the 4 GB Node heap cap.
+- `compute_min_instances: 1` so the container stays warm and the build happens on deploy
+  rather than on user traffic.
 
-Once started, open the Databricks App URL from the CLI output or the **Compute → Apps** UI in your Databricks workspace. During initial boot (while LibreChat clones and builds its frontend assets), the app serves a live status dashboard showing real-time progress for Lakebase PostgreSQL, Embedded MongoDB, Unity Gateway, and LibreChat.
+The app binds its HTTP port within seconds of launch, so the platform's 10-minute startup
+window is satisfied regardless; the build time is a user-experience cost, not a health-check
+failure.
 
 ---
 
-## Configuring Models & MCP Servers (Three-Level Namespace)
+## Models & MCP Servers (three-level namespace)
+
+Both URL shapes below were verified live against a workspace.
 
 ### Model Services (`catalog.schema.model_service_name`)
-LibreChat queries foundation and custom models through Unity Gateway's [OpenAI-compatible Unified API](https://docs.databricks.com/aws/en/ai-gateway/query-model-services):
-- **Endpoint Base URL**: `https://${DATABRICKS_HOST}/ai-gateway/mlflow/v1`
-- **Default Models**:
-  - `system.ai.claude-sonnet-4-5`
-  - `system.ai.claude-opus-4-5`
-  - `system.ai.gpt-5-6-sol`
-- **Default Embedding Model (for RAG + Lakebase `pgvector`)**:
-  - `system.ai.databricks-gte-large-en`
+
+OpenAI-compatible, via Unity Gateway's
+[unified API](https://docs.databricks.com/aws/en/ai-gateway/query-model-services):
+
+```
+POST https://<workspace-host>/ai-gateway/mlflow/v1/chat/completions
+     {"model": "system.ai.claude-sonnet-5-5", ...}
+```
+
+Defaults: `claude-opus-5-5`, `claude-sonnet-5-5`, `claude-haiku-5-5`, `gpt-5-6-sol` (all
+under `system.ai`). Conversation titles use `unity_gateway_title_model`
+(`system.ai.claude-haiku-5-5`) because titles are generated on every new chat.
+
+Embeddings default to **`system.ai.gte-large-en`** (1024-dim). Note that
+`system.ai.databricks-gte-large-en` does *not* exist and returns `404 NOT_FOUND`.
 
 ### MCP Services (`catalog.schema.mcp_service_name`)
-LibreChat connects to governed [MCP servers through Unity Gateway](https://docs.databricks.com/aws/en/agents/mcp-tools/) using `streamable-http` transport:
-- **Endpoint URL Pattern**: `https://${DATABRICKS_HOST}/ai-gateway/mcp-services/<catalog>.<schema>.<mcp_service_name>`
-- **Default MCP Services**:
-  - `system.ai.dbsql` — Databricks SQL MCP server
-  - `system.ai.genie_one_mcp` — Databricks Genie One MCP server
-  - `system.ai.web_search` — Databricks Web Search MCP server
 
-### Overriding Models or MCP Services
-You can customize the three-level namespace services in `app/app.yaml`, `app/librechat.yaml`, or via DAB variables in `databricks.yml`:
+```
+POST https://<workspace-host>/ai-gateway/mcp-services/<catalog>.<schema>.<name>
+```
+
+Defaults: `system.ai.dbsql`, `system.ai.genie_one_mcp`, `system.ai.web_search`.
+List what your workspace actually has:
 
 ```bash
-databricks bundle deploy -p <your-databricks-profile> \
-  --var="unity_gateway_default_model=system.ai.claude-sonnet-4-5" \
-  --var="unity_gateway_models=system.ai.claude-sonnet-4-5,system.ai.gpt-5-6-sol,main.ai.my_custom_model" \
-  --var="unity_gateway_mcp_services=system.ai.dbsql,system.ai.genie_one_mcp,main.ai.my_custom_mcp"
+databricks ai-gateway list-model-services -p <profile>
+databricks ai-gateway list-mcp-services   -p <profile>
+```
+
+### Overriding them
+
+These are real bundle variables, resolved into the app's `config.env` at deploy time:
+
+```bash
+databricks bundle deploy -t dev -p <profile> \
+  --var="unity_gateway_default_model=system.ai.claude-opus-5-5" \
+  --var="unity_gateway_models=system.ai.claude-opus-5-5,main.ai.my_custom_model" \
+  --var="unity_gateway_mcp_services=system.ai.dbsql,main.ai.my_custom_mcp"
+```
+
+> Do **not** try to use `${var.*}` inside `app/app.yaml` — bundle variables are not
+> interpolated there and would reach the container literally. `app/app.yaml` holds literal
+> defaults for UI-driven deploys; the DAB-managed copy lives in
+> `resources/librechat.app.yml` under `config:`. Keep the two in sync.
+
+> A new MCP service needs no code change. Titles are sanitized automatically, because
+> LibreChat validates MCP titles against ``^[\p{L}\p{N}][\p{L}\p{N}\p{M}'’ -]*$`` —
+> parentheses, dots and underscores in a `title` make LibreChat **reject the whole config
+> and exit at startup**, so three-level names belong in `description` only.
+
+---
+
+## Repository structure
+
+```text
+.
+├── databricks.yml                        # Bundle config and all tunable variables
+├── resources/
+│   ├── lakebase.postgres.yml             # Lakebase Autoscaling Postgres 17 project & branch
+│   ├── librechat_state.schema.yml        # UC schema for cached runtime artifacts
+│   ├── librechat_state.volume.yml        # UC Volume caching the mongod binary
+│   └── librechat.app.yml                 # App resource, OBO scopes, runtime config, bindings
+└── app/
+    ├── app.yaml                          # Literal runtime config for UI-driven deploys
+    ├── librechat.yaml                    # LibreChat config template (rendered at startup)
+    ├── requirements.txt                  # Pinned Python dependencies
+    └── scripts/
+        ├── start_app.py                  # Orchestrator: ingress proxy, Lakebase, Mongo, RAG, LibreChat
+        ├── start_mongodb.cjs             # Embedded ephemeral MongoDB launcher
+        └── databricks_obo_preload.cjs    # Node preload hook injecting per-user OBO tokens
 ```
 
 ---
 
-## How It Works Under the Hood
+## How it works
 
-### 1. Zero Changes to Core LibreChat
-- `app/scripts/start_app.py` clones the official upstream `https://github.com/LibreChat-AI/LibreChat` repository at the tag specified by `LIBRECHAT_VERSION` (default `v0.8.8`) and runs it unmodified.
-- All Databricks integrations happen purely through environment variables (`MONGO_URI`, `DATABASE_URL`, `POSTGRES_*`, `CONFIG_PATH`) and a Node.js `--require` preload module (`app/scripts/databricks_obo_preload.cjs`).
+### 1. Zero changes to LibreChat
 
-### 2. Lakebase Autoscaling for PostgreSQL (`pgvector`)
-- Attaching the `postgres` resource in `resources/librechat.app.yml` causes Databricks Apps to inject `PGHOST`, `PGPORT`, `PGDATABASE`, `PGUSER`, `PGSSLMODE=require`, and `LAKEBASE_ENDPOINT`.
-- `app/scripts/start_app.py` calls `w.postgres.generate_database_credential(endpoint=os.environ["LAKEBASE_ENDPOINT"])` to mint an OAuth token (automatically refreshed in the background before the 1-hour expiry), initializes the `librechat` schema and `vector` (`pgvector`) extension, and constructs the standard PostgreSQL connection string:
-  ```text
-  postgresql://<PGUSER>:<OAUTH_TOKEN>@<PGHOST>:5432/<PGDATABASE>?sslmode=require
-  ```
+`start_app.py` clones `LibreChat-AI/LibreChat` at `LIBRECHAT_VERSION` and runs it as-is.
+Integration is entirely via environment variables (`MONGO_URI`, `DATABASE_URL`, `POSTGRES_*`,
+`CONFIG_PATH`), a rendered `/tmp/librechat.yaml`, and
+`NODE_OPTIONS="--require scripts/databricks_obo_preload.cjs"`.
 
-### 3. Embedded Ephemeral MongoDB & Seamless SSO User Provisioning
-- `app/scripts/start_mongodb.cjs` starts a local `mongod` instance inside the Databricks App container on `127.0.0.1:27017` backed by `/tmp/librechat-mongodb`, exposing `MONGO_URI=mongodb://127.0.0.1:27017/LibreChat`.
-- Because `/tmp/librechat-mongodb` is ephemeral when the Databricks App compute spins down, the ingress proxy inspects `/api/auth/refresh` requests and automatically registers/logs in the authenticated Databricks user (`x-forwarded-email`) using LibreChat's native `/api/auth/register` and `/api/auth/login` endpoints. Users never have to manually create an account after an app restart, and `{{LIBRECHAT_USER_EMAIL}}` in LibreChat always matches the caller's Databricks identity.
+### 2. Lakebase for PostgreSQL
 
-### 4. On-Behalf-Of (OBO) Authentication to Unity Gateway
-- Databricks Apps forwards the logged-in user's OAuth token in the `x-forwarded-access-token` request header.
-- `app/librechat.yaml` passes `x-librechat-user-email: "{{LIBRECHAT_USER_EMAIL}}"` on both `endpoints.custom` (Unity Gateway Models) and `mcpServers` (Unity Gateway MCPs), which also instructs LibreChat to isolate MCP connections per user (`startup: false`).
-- `app/scripts/databricks_obo_preload.cjs` intercepts outbound `fetch` / `undici` / `https` requests targeting `https://${DATABRICKS_HOST}/ai-gateway/*` and replaces the `Authorization` header with `Bearer <x-forwarded-access-token>` for that user (with automatic fallback to the App Service Principal token if no user token is present).
+Attaching the `postgres` app resource makes the platform inject `PGHOST`, `PGPORT`,
+`PGDATABASE`, `PGUSER`, `PGSSLMODE=require` and `LAKEBASE_ENDPOINT`. The orchestrator calls
+`w.postgres.generate_database_credential(endpoint=os.environ["LAKEBASE_ENDPOINT"])` to mint a
+1-hour OAuth token, creates the `librechat` schema and the `vector` extension, and builds:
+
+```text
+postgresql://<PGUSER>:<OAUTH_TOKEN>@<PGHOST>:5432/<PGDATABASE>?sslmode=require
+```
+
+A background loop re-mints the token every 40 minutes and **restarts the RAG API** so the
+child process picks up the new password — refreshing this process's environment alone is not
+enough, and without the restart Lakebase auth silently breaks about an hour in.
+
+> **Two different database names.** The Lakebase *resource* ID is hyphenated
+> (`.../databases/databricks-postgres`) while the *PostgreSQL* database name is underscored
+> (`databricks_postgres`). The app binding needs the hyphenated resource ID; `PGDATABASE`
+> gets the underscored name automatically. Confirm with:
+> `databricks postgres list-databases projects/<project>/branches/<branch> -p <profile>`
+
+> **Deploy before you connect locally.** The app's service principal has
+> `CAN_CONNECT_AND_CREATE`, which lets it create objects but not use schemas owned by someone
+> else. It must create the `librechat` schema itself to own it. If you connect with your own
+> credentials first and create that schema, the SP will hit `permission denied ... 42501`.
+
+### 3. MongoDB
+
+With a loopback `mongo_uri`, `start_mongodb.cjs` runs a standalone `mongod` on
+`127.0.0.1:27017` backed by `/tmp/librechat-mongodb`. Because that store is ephemeral, the
+ingress proxy watches `/api/auth/refresh` and auto-provisions the signed-in Databricks user
+through LibreChat's own `/api/auth/register` and `/api/auth/login`, so nobody has to create
+an account again after a restart.
+
+Self-registration therefore has to stay enabled — so the proxy **rejects any registration
+whose email does not match the Databricks-verified `x-forwarded-email`**. Without that gate,
+any app-authorized user could register under a colleague's address and, because OBO tokens
+are cached per email, pick up that colleague's Unity Gateway token.
+
+`mongodb-memory-server` is only a devDependency of LibreChat's `api` workspace, so the
+orchestrator verifies it resolves and installs it explicitly if not, rather than assuming.
+The downloaded `mongod` binary is cached to the UC Volume so later cold starts don't need
+`fastdl.mongodb.org`.
+
+### 4. On-Behalf-Of authentication, failing closed
+
+Databricks Apps forwards the signed-in user's token as `x-forwarded-access-token`.
+`databricks_obo_preload.cjs` intercepts outbound `fetch` / `undici` / `https` calls to
+`/ai-gateway/*` and swaps in that user's bearer token, resolved in this order:
+
+1. the token on the in-flight request (`AsyncLocalStorage`) — the normal path;
+2. a token cached for **that same caller's** verified email;
+3. nothing.
+
+There is deliberately **no "most recent user" fallback**. If no token resolves, the
+`Authorization` header is *removed* so the call fails visibly with a 401 rather than silently
+running as the app's service principal with different privileges. Set
+`DATABRICKS_OBO_ALLOW_SP_FALLBACK=true` to accept that downgrade.
+
+One documented exception: embeddings. The RAG API calls Unity Gateway through a loopback
+bridge on `127.0.0.1:3081` and carries no user identity, so **embeddings run as the app's
+service principal and are not user-attributed**.
 
 ---
 
-## Health & Diagnostics
+## Known limitations
 
-At any time while the app is running, you can query `/api/databricks/health` on the Databricks App URL to inspect the live status of Lakebase, Embedded MongoDB, the RAG API, and OBO token detection:
+- **Streaming is capped at 120 seconds.** The Databricks Apps reverse proxy enforces a
+  non-configurable 120-second per-request timeout and may buffer SSE. LibreChat streams chat
+  over SSE, so a single generation longer than 120s returns a 504 **generated at the proxy,
+  with nothing in the app logs**. Long agent/tool loops over the MCP servers are the most
+  likely way to hit this.
+- **One instance only** while MongoDB is embedded. Each replica would have its own database
+  and its own per-boot JWT secret, so sessions and history would break at random. Pinned via
+  `compute_min_instances: 1` / `compute_max_instances: 1`.
+- **Session secrets are regenerated on every boot.** Correct while MongoDB is ephemeral
+  (there is no persisted data to decrypt), but when you move to an external MongoDB, set
+  `JWT_SECRET`, `JWT_REFRESH_SECRET`, `CREDS_KEY` and `CREDS_IV` from a Databricks secret
+  scope so sessions and stored credentials survive restarts.
+- **Meilisearch is disabled** (`SEARCH=false`); LibreChat's full-text conversation search is
+  unavailable.
+- **OBO scopes can be wiped by a destructive app update.** Re-check `user_api_scopes` after
+  any out-of-band change to the app.
 
-```json
-{
-  "ready": true,
-  "phase": "LibreChat is running and ready.",
-  "error": null,
-  "lakebase": {
-    "status": "connected",
-    "host": "<endpoint>.database.cloud.databricks.com",
-    "database": "databricks_postgres"
-  },
-  "mongodb": {
-    "status": "running",
-    "uri": "mongodb://127.0.0.1:27017/LibreChat"
-  },
-  "rag_api": {
-    "status": "running"
-  },
-  "unity_gateway": {
-    "host": "<workspace>.cloud.databricks.com",
-    "obo_user_detected": true,
-    "obo_user_email": "user@company.com",
-    "models": [
-      "system.ai.claude-sonnet-4-5",
-      "system.ai.claude-opus-4-5",
-      "system.ai.gpt-5-6-sol"
-    ],
-    "mcp_services": [
-      "system.ai.dbsql",
-      "system.ai.genie_one_mcp",
-      "system.ai.web_search"
-    ]
-  }
-}
+## Health & diagnostics
+
+```bash
+curl -s https://<app-url>/api/databricks/health | jq
 ```
+
+Reports `ready`/`phase`, Lakebase status and host, MongoDB status (`running (ephemeral)` vs
+`external`), RAG API status, and the resolved Unity Gateway host, models, embedding model,
+MCP services, and whether an OBO user token was seen on the request.

@@ -1,4 +1,11 @@
-databricks-sdk>=0.49.0
-aiohttp>=3.9.0
-psycopg2-binary>=2.9.9
-PyYAML>=6.0.1
+# Pinned: the Databricks Apps guide calls for exact versions, and an unpinned
+# floor silently depended on pip resolving something new enough.
+# databricks-sdk >= 0.81.0 is required for the `w.postgres` (Lakebase
+# Autoscaling) client used by scripts/start_app.py.
+databricks-sdk==0.154.0
+aiohttp==3.14.5
+psycopg2-binary==2.9.10
+PyYAML==6.0.2
+# Used to serve LibreChat's companion RAG API (uvicorn was previously invoked
+# but never declared, and only arrived via the RAG API's own requirements).
+uvicorn==0.38.0

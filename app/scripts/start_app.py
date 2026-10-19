@@ -9,8 +9,10 @@ Runs inside a Databricks App container and coordinates:
 2. Lakebase Autoscaling PostgreSQL connection string generation (`PGHOST`, `PGPORT`,
    `PGDATABASE`, `PGUSER`, `PGSSLMODE=require`, OAuth credential via `LAKEBASE_ENDPOINT`)
    and `pgvector` + schema initialization.
-3. Embedded ephemeral MongoDB (`mongod` on `127.0.0.1:27017/LibreChat`) running on
-   the same Databricks App compute (`MONGO_URI=mongodb://127.0.0.1:27017/LibreChat`).
+3. MongoDB connectivity. If `MONGO_URI` is set it is used verbatim (point it at a
+   managed MongoDB for durable history). If it is empty, an ephemeral `mongod` is
+   started on `127.0.0.1:27017` inside this container and ALL LibreChat state --
+   conversations, users, agents, prompts -- is lost when the app restarts.
 4. Dynamic rendering of `/tmp/librechat.yaml` with 3-level Unity Catalog namespace
    Model Services (`catalog.schema.model_service_name`) and MCP Services
    (`catalog.schema.mcp_service_name`) routed through Databricks Unity Gateway.
@@ -29,6 +31,7 @@ import html
 import json
 import logging
 import os
+import re
 import secrets
 import shutil
 import socket
@@ -60,11 +63,61 @@ LIBRECHAT_INTERNAL_PORT = int(os.environ.get("LIBRECHAT_INTERNAL_PORT", "3080"))
 OBO_BRIDGE_PORT = int(os.environ.get("OBO_BRIDGE_PORT", "3081"))
 RAG_API_PORT = int(os.environ.get("RAG_PORT", "8001"))
 
-LIBRECHAT_DIR = Path(os.environ.get("LIBRECHAT_Runtime_DIR", "/tmp/librechat"))
+LIBRECHAT_DIR = Path(os.environ.get("LIBRECHAT_RUNTIME_DIR", "/tmp/librechat"))
 RAG_API_DIR = Path(os.environ.get("RAG_API_RUNTIME_DIR", "/tmp/librechat-rag-api"))
 RENDERED_CONFIG_PATH = Path("/tmp/librechat.yaml")
 OBO_CACHE_FILE = Path("/tmp/databricks_obo_tokens.json")
 SP_TOKEN_FILE = Path("/tmp/databricks_sp_token")
+
+# Default embedding model. Verified against Unity Gateway: `system.ai.gte-large-en`
+# resolves (gte-large-en-v1.5, 1024-dim); `system.ai.databricks-gte-large-en`
+# does not exist and returns 404 NOT_FOUND.
+DEFAULT_EMBEDDING_MODEL = "system.ai.gte-large-en"
+DEFAULT_CHAT_MODEL = "system.ai.claude-sonnet-5-5"
+DEFAULT_CHAT_MODELS = (
+    "system.ai.claude-opus-5-5,system.ai.claude-sonnet-5-5,"
+    "system.ai.claude-haiku-5-5,system.ai.gpt-5-6-sol"
+)
+DEFAULT_MCP_SERVICES = "system.ai.dbsql,system.ai.genie_one_mcp,system.ai.web_search"
+# Conversation titles are generated on every new chat, so default them to the
+# cheapest capable model rather than whatever the user picked for chat.
+DEFAULT_TITLE_MODEL = "system.ai.claude-haiku-5-5"
+
+EMBEDDED_MONGO_URI = "mongodb://127.0.0.1:27017/LibreChat"
+_LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1", "[::1]", "0.0.0.0"}
+
+
+def _mongo_uri_is_loopback(uri: str) -> bool:
+    """
+    True when `uri` points at this container, i.e. we are expected to start the
+    embedded ephemeral mongod. Any other host is an external, durable MongoDB
+    that we must not try to manage.
+    """
+    if not uri:
+        return True
+    try:
+        parsed = urllib.parse.urlsplit(uri)
+    except Exception:
+        return False
+    if parsed.scheme not in ("mongodb", "mongodb+srv"):
+        return False
+    hosts = (parsed.netloc.rsplit("@", 1)[-1]).split(",")
+    return all((h.rsplit(":", 1)[0] or "").strip().lower() in _LOOPBACK_HOSTS for h in hosts if h)
+
+
+MONGO_URI = (os.environ.get("MONGO_URI") or "").strip() or EMBEDDED_MONGO_URI
+USE_EMBEDDED_MONGO = _mongo_uri_is_loopback(MONGO_URI)
+
+# UC Volume used to cache the mongod binary between cold starts, so startup does
+# not depend on egress to fastdl.mongodb.org every time.
+STATE_VOLUME = (os.environ.get("LIBRECHAT_STATE_VOLUME") or "").strip().rstrip("/")
+MONGO_BIN_DIR = Path(os.environ.get("MONGOMS_DOWNLOAD_DIR", "/tmp/mongodb-binaries"))
+MONGO_BIN_CACHE_NAME = "mongodb-binaries.tar.gz"
+
+# LibreChat validates MCP server titles against this pattern
+# (packages/data-provider/src/mcp.ts). A title containing parentheses, dots or
+# underscores makes LibreChat reject the entire config and exit at startup.
+MCP_TITLE_ALLOWED = re.compile(r"[^\w \-']|_", re.UNICODE)
 
 # Shared cryptographic secrets generated once per app boot if not provided
 JWT_SECRET = os.environ.get("JWT_SECRET") or secrets.token_hex(32)
@@ -89,7 +142,8 @@ class AppState:
         self.database_url: str = ""
 
         self.mongodb_status: str = "pending"
-        self.mongo_uri: str = os.environ.get("MONGO_URI", "mongodb://127.0.0.1:27017/LibreChat")
+        self.mongo_uri: str = EMBEDDED_MONGO_URI if USE_EMBEDDED_MONGO else MONGO_URI
+        self.mongo_is_embedded: bool = USE_EMBEDDED_MONGO
 
         self.rag_api_status: str = "pending"
         self.librechat_status: str = "pending"
@@ -99,8 +153,6 @@ class AppState:
 
         # OBO token store: email -> access token
         self.obo_tokens_by_email: Dict[str, str] = {}
-        self.latest_obo_token: Optional[str] = None
-        self.latest_obo_email: Optional[str] = None
         self.obo_lock = threading.Lock()
 
         # Subprocesses
@@ -115,37 +167,45 @@ class AppState:
         logger.info(msg)
 
     def record_obo_token(self, token: Optional[str], email: Optional[str]) -> None:
+        """
+        Caches a user's OBO token keyed ONLY by that user's Databricks-verified
+        email (`x-forwarded-email`).
+
+        A token is never stored unkeyed. An earlier version also kept a
+        `latest_token`, which let one user's request be authorized with whichever
+        user had most recently touched the app -- a cross-user identity leak that
+        defeats the point of per-user Unity Gateway governance. The field is gone
+        so that fallback is structurally impossible.
+        """
         if not token or not token.strip():
             return
-        clean_tok = token.strip()
         clean_email = email.strip().lower() if email and email.strip() else None
+        if not clean_email:
+            logger.debug("Dropping OBO token with no verified x-forwarded-email")
+            return
+        clean_tok = token.strip()
         with self.obo_lock:
-            self.latest_obo_token = clean_tok
-            if clean_email:
-                self.latest_obo_email = clean_email
-                self.obo_tokens_by_email[clean_email] = clean_tok
+            self.obo_tokens_by_email[clean_email] = clean_tok
             payload = {
-                "latest_token": self.latest_obo_token,
-                "latest_email": self.latest_obo_email,
                 "by_email": dict(self.obo_tokens_by_email),
                 "updated_at": time.time(),
             }
             try:
                 tmp_path = OBO_CACHE_FILE.with_suffix(".tmp")
                 tmp_path.write_text(json.dumps(payload), encoding="utf-8")
+                os.chmod(tmp_path, 0o600)
                 tmp_path.replace(OBO_CACHE_FILE)
             except Exception as exc:
                 logger.debug("Failed writing OBO token cache: %s", exc)
 
-    def resolve_obo_or_sp_token(self, email: Optional[str] = None) -> tuple[str, str]:
-        with self.obo_lock:
-            if email:
-                clean = email.strip().lower()
+    def resolve_obo_token(self, email: Optional[str]) -> tuple[Optional[str], str]:
+        """Resolves a token for `email` only -- never another user's token."""
+        if email:
+            clean = email.strip().lower()
+            with self.obo_lock:
                 if clean in self.obo_tokens_by_email:
                     return self.obo_tokens_by_email[clean], f"OBO({clean})"
-            if self.latest_obo_token:
-                return self.latest_obo_token, f"OBO({self.latest_obo_email or 'active-user'})"
-        return self.sp_token, "SP-fallback"
+        return None, "no-obo-token"
 
 
 STATE = AppState()
@@ -257,7 +317,15 @@ def refresh_lakebase_connection_string(w: WorkspaceClient, initialize_schema: bo
 
 
 def credential_refresh_loop() -> None:
-    """Refreshes Service Principal token and Lakebase 1-hour OAuth token every 40 minutes."""
+    """
+    Refreshes the Service Principal token and the Lakebase 1-hour OAuth token
+    every 40 minutes, then restarts the RAG API so it picks up the new password.
+
+    Refreshing `os.environ` in this process is not enough: `rag_api` is a child
+    process that captured the old password in its environment at spawn time, so
+    without the restart its Lakebase connections start failing about an hour in
+    and never recover.
+    """
     while True:
         time.sleep(40 * 60)
         try:
@@ -265,8 +333,28 @@ def credential_refresh_loop() -> None:
             init_databricks_workspace_and_sp_token(w)
             refresh_lakebase_connection_string(w, initialize_schema=False)
             STATE.add_log("Refreshed Databricks Service Principal & Lakebase OAuth tokens.")
+            restart_rag_api()
         except Exception as exc:
             logger.warning("Periodic token refresh warning: %s", exc)
+
+
+def restart_rag_api() -> None:
+    """Restarts the stateless RAG API so it re-reads the refreshed Lakebase credential."""
+    proc = STATE.rag_proc
+    if proc is None or proc.poll() is not None:
+        return
+    STATE.add_log("Restarting RAG API to pick up the refreshed Lakebase credential...")
+    try:
+        proc.terminate()
+        try:
+            proc.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=10)
+    except Exception as exc:
+        STATE.add_log(f"RAG API shutdown note: {exc}")
+    STATE.rag_proc = None
+    start_rag_api_with_lakebase()
 
 
 # =============================================================================
@@ -277,22 +365,34 @@ def parse_csv_env(name: str, default: str) -> List[str]:
     return [item.strip() for item in raw.split(",") if item.strip()]
 
 
+def safe_mcp_title(raw: str, fqn: str) -> str:
+    """
+    Coerces a title into LibreChat's MCP title grammar
+    (`^[\\p{L}\\p{N}][\\p{L}\\p{N}\\p{M}'\u2019 -]*$`): letters, digits, spaces,
+    hyphens and apostrophes only. Parentheses, dots and underscores -- which a
+    three-level name like `system.ai.genie_one_mcp` is full of -- make LibreChat
+    reject the whole config and exit at startup, so they must never reach it.
+    """
+    cleaned = MCP_TITLE_ALLOWED.sub(" ", raw or "")
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" -'")
+    while cleaned and not cleaned[0].isalnum():
+        cleaned = cleaned[1:].lstrip()
+    if not cleaned:
+        leaf = fqn.rsplit(".", 1)[-1].replace("_", " ").replace("-", " ")
+        cleaned = re.sub(r"\s+", " ", f"Databricks {leaf}").strip().title()
+    return cleaned
+
+
 def render_librechat_yaml() -> Path:
     template_path = APP_ROOT / "librechat.yaml"
     config = yaml.safe_load(template_path.read_text(encoding="utf-8"))
 
-    default_model = os.environ.get("UNITY_GATEWAY_DEFAULT_MODEL", "system.ai.claude-sonnet-4-5").strip()
-    models = parse_csv_env(
-        "UNITY_GATEWAY_MODELS",
-        "system.ai.claude-sonnet-4-5,system.ai.claude-opus-4-5,system.ai.gpt-5-6-sol",
-    )
+    default_model = (os.environ.get("UNITY_GATEWAY_DEFAULT_MODEL") or DEFAULT_CHAT_MODEL).strip()
+    models = parse_csv_env("UNITY_GATEWAY_MODELS", DEFAULT_CHAT_MODELS)
     if default_model and default_model not in models:
         models.insert(0, default_model)
 
-    mcp_services = parse_csv_env(
-        "UNITY_GATEWAY_MCP_SERVICES",
-        "system.ai.dbsql,system.ai.genie_one_mcp,system.ai.web_search",
-    )
+    mcp_services = parse_csv_env("UNITY_GATEWAY_MCP_SERVICES", DEFAULT_MCP_SERVICES)
 
     # 1. Configure 3-level namespace Model Services via Unity Gateway (/ai-gateway/mlflow/v1)
     custom_endpoints = config.setdefault("endpoints", {}).setdefault("custom", [])
@@ -303,16 +403,21 @@ def render_librechat_yaml() -> Path:
             "default": models,
             "fetch": False,
         }
-        ugw_endpoint["titleModel"] = default_model
+        ugw_endpoint["titleModel"] = (
+            os.environ.get("UNITY_GATEWAY_TITLE_MODEL") or DEFAULT_TITLE_MODEL
+        ).strip()
 
     # 2. Configure 3-level namespace MCP Services via Unity Gateway (/ai-gateway/mcp-services/<catalog>.<schema>.<service>)
     mcp_servers_cfg = config.get("mcpServers") or {}
     rendered_mcps: Dict[str, Any] = {}
     for mcp_fqn in mcp_services:
         existing = mcp_servers_cfg.get(mcp_fqn, {})
+        leaf = mcp_fqn.rsplit(".", 1)[-1].replace("_", " ").replace("-", " ").title()
         rendered_mcps[mcp_fqn] = {
             "type": existing.get("type", "streamable-http"),
-            "title": existing.get("title", f"Unity Gateway MCP ({mcp_fqn})"),
+            # Sanitized unconditionally, including titles that came from the
+            # template, so a hand-edited librechat.yaml cannot take the app down.
+            "title": safe_mcp_title(existing.get("title") or f"Databricks {leaf}", mcp_fqn),
             "description": existing.get(
                 "description",
                 f"Databricks Unity Gateway governed MCP service {mcp_fqn} (OBO authenticated)",
@@ -385,6 +490,94 @@ def wait_for_tcp_port(host: str, port: int, timeout_sec: float = 120.0) -> bool:
     return False
 
 
+def preflight_required_tools() -> None:
+    """
+    Fails fast with an actionable message instead of a confusing stack trace.
+
+    This app builds LibreChat from source in-container, so it needs `git`, `node`
+    and `npm` on PATH, plus outbound network access to github.com and
+    registry.npmjs.org. In an egress-restricted workspace those hosts (and
+    fastdl.mongodb.org for the mongod binary, pypi.org for the RAG API) must be
+    allowlisted in the egress policy, and the app restarted afterwards.
+    """
+    missing = [t for t in ("git", "node", "npm") if shutil.which(t) is None]
+    if missing:
+        raise RuntimeError(
+            f"Required tool(s) not available in the Databricks App container: {', '.join(missing)}. "
+            "LibreChat is built from source at startup and needs git, node and npm on PATH."
+        )
+    versions = []
+    for tool, args in (("git", ["--version"]), ("node", ["--version"]), ("npm", ["--version"])):
+        try:
+            out = subprocess.run([tool, *args], capture_output=True, text=True, timeout=30)
+            versions.append(f"{tool}={out.stdout.strip() or out.stderr.strip()}")
+        except Exception as exc:
+            versions.append(f"{tool}=unknown ({exc})")
+    STATE.add_log("Preflight OK: " + ", ".join(versions))
+
+
+def ensure_mongodb_memory_server() -> None:
+    """
+    `mongodb-memory-server` is a devDependency of LibreChat's `api` workspace, so
+    it only lands in node_modules because `npm ci` installs devDependencies. Do
+    not rely on that -- verify, and install it locally if it is absent.
+    """
+    probe = subprocess.run(
+        ["node", "-e", "require.resolve('mongodb-memory-server'); console.log('ok')"],
+        cwd=str(LIBRECHAT_DIR),
+        capture_output=True,
+        text=True,
+    )
+    if probe.returncode == 0:
+        STATE.add_log("mongodb-memory-server resolved from LibreChat node_modules.")
+        return
+    STATE.add_log("mongodb-memory-server not resolvable; installing it explicitly (no-save).")
+    run_cmd_logged(
+        ["npm", "install", "--no-save", "--no-audit", "mongodb-memory-server@^11"],
+        cwd=LIBRECHAT_DIR,
+        prefix="npm-mongodb-memory-server",
+    )
+
+
+def restore_mongod_binary_cache(w: WorkspaceClient) -> None:
+    """Restores the cached mongod binary from the UC Volume, if one is there."""
+    if not STATE_VOLUME:
+        return
+    remote = f"{STATE_VOLUME}/{MONGO_BIN_CACHE_NAME}"
+    try:
+        if any(MONGO_BIN_DIR.rglob("mongod")):
+            return
+        MONGO_BIN_DIR.mkdir(parents=True, exist_ok=True)
+        archive = Path("/tmp") / MONGO_BIN_CACHE_NAME
+        resp = w.files.download(remote)
+        with open(archive, "wb") as fh:
+            shutil.copyfileobj(resp.contents, fh)
+        shutil.unpack_archive(str(archive), str(MONGO_BIN_DIR))
+        archive.unlink(missing_ok=True)
+        STATE.add_log(f"Restored cached mongod binary from {remote}")
+    except Exception as exc:
+        # Cache miss on a first run is the normal path, not an error.
+        STATE.add_log(f"No cached mongod binary at {remote} ({exc}); it will be downloaded.")
+
+
+def save_mongod_binary_cache(w: WorkspaceClient) -> None:
+    """Uploads the downloaded mongod binary so later cold starts skip the download."""
+    if not STATE_VOLUME:
+        return
+    remote = f"{STATE_VOLUME}/{MONGO_BIN_CACHE_NAME}"
+    try:
+        if not any(MONGO_BIN_DIR.rglob("mongod")):
+            return
+        base = Path("/tmp") / "mongodb-binaries-cache"
+        archive = Path(shutil.make_archive(str(base), "gztar", root_dir=str(MONGO_BIN_DIR)))
+        with open(archive, "rb") as fh:
+            w.files.upload(remote, fh, overwrite=True)
+        archive.unlink(missing_ok=True)
+        STATE.add_log(f"Cached mongod binary to {remote} for future cold starts.")
+    except Exception as exc:
+        STATE.add_log(f"Could not cache mongod binary (non-fatal): {exc}")
+
+
 def ensure_unmodified_librechat_repo() -> None:
     version = os.environ.get("LIBRECHAT_VERSION", "v0.8.8").strip()
     if not (LIBRECHAT_DIR / "package.json").exists():
@@ -429,9 +622,25 @@ def ensure_unmodified_librechat_repo() -> None:
         )
 
 
-def start_embedded_mongodb() -> None:
+def start_embedded_mongodb(w: WorkspaceClient) -> None:
+    if not USE_EMBEDDED_MONGO:
+        STATE.mongodb_status = "external"
+        STATE.add_log(
+            "MONGO_URI points at an external MongoDB; skipping the embedded mongod. "
+            "LibreChat state is durable."
+        )
+        return
+
     STATE.phase = "Starting embedded ephemeral MongoDB on 127.0.0.1:27017..."
     STATE.mongodb_status = "starting"
+    STATE.add_log(
+        "MONGO_URI is unset: starting an EPHEMERAL in-container MongoDB. All LibreChat "
+        "state (conversations, users, agents, prompts) is lost when this app restarts. "
+        "Set the `mongo_uri` bundle variable to an external MongoDB for durable history."
+    )
+
+    ensure_mongodb_memory_server()
+    restore_mongod_binary_cache(w)
 
     if wait_for_tcp_port("127.0.0.1", 27017, timeout_sec=1.0):
         STATE.mongodb_status = "running"
@@ -451,11 +660,16 @@ def start_embedded_mongodb() -> None:
     STATE.mongo_proc = proc
     stream_process_logs(proc, "mongodb")
 
-    if not wait_for_tcp_port("127.0.0.1", 27017, timeout_sec=120.0):
-        raise RuntimeError("Embedded MongoDB failed to bind 127.0.0.1:27017 within 120s")
+    if not wait_for_tcp_port("127.0.0.1", 27017, timeout_sec=300.0):
+        raise RuntimeError(
+            "Embedded MongoDB failed to bind 127.0.0.1:27017 within 300s. If this workspace "
+            "restricts egress, allowlist fastdl.mongodb.org (the mongod binary download) and "
+            "restart the app."
+        )
 
-    STATE.mongodb_status = "running"
+    STATE.mongodb_status = "running (ephemeral)"
     STATE.add_log(f"Embedded MongoDB ready at MONGO_URI={STATE.mongo_uri}")
+    save_mongod_binary_cache(w)
 
 
 def start_rag_api_with_lakebase() -> None:
@@ -516,7 +730,7 @@ def start_rag_api_with_lakebase() -> None:
                 "JWT_SECRET": JWT_SECRET,
                 "EMBEDDINGS_PROVIDER": "openai",
                 "EMBEDDINGS_MODEL": os.environ.get(
-                    "UNITY_GATEWAY_EMBEDDING_MODEL", "system.ai.databricks-gte-large-en"
+                    "UNITY_GATEWAY_EMBEDDING_MODEL", DEFAULT_EMBEDDING_MODEL
                 ),
                 "OPENAI_BASEURL": f"http://127.0.0.1:{OBO_BRIDGE_PORT}/ai-gateway/mlflow/v1",
                 "RAG_OPENAI_API_KEY": STATE.sp_token or "databricks-obo",
@@ -587,9 +801,22 @@ def start_librechat_backend(config_path: Path) -> None:
             "NODE_OPTIONS": node_options,
             # Standard LibreChat runtime settings
             "APP_TITLE": "LibreChat on Databricks",
+            # Registration must stay enabled because the ingress proxy
+            # auto-provisions the signed-in Databricks user through LibreChat's
+            # own /api/auth/register. The proxy rejects any registration whose
+            # email does not match the Databricks-verified `x-forwarded-email`
+            # (see `handle_ingress_proxy`), so a user cannot claim a colleague's
+            # identity and pick up their cached OBO token.
             "ALLOW_REGISTRATION": "true",
             "ALLOW_EMAIL_LOGIN": "true",
             "ALLOW_SOCIAL_LOGIN": "false",
+            # When no per-user OBO token is available, fail the Unity Gateway
+            # call rather than silently falling back to the app Service
+            # Principal (which would run with different privileges than the
+            # caller). Set to "true" only if you accept that downgrade.
+            "DATABRICKS_OBO_ALLOW_SP_FALLBACK": os.environ.get(
+                "DATABRICKS_OBO_ALLOW_SP_FALLBACK", "false"
+            ),
             "JWT_SECRET": JWT_SECRET,
             "JWT_REFRESH_SECRET": JWT_REFRESH_SECRET,
             "CREDS_KEY": CREDS_KEY,
@@ -633,9 +860,10 @@ def bootstrap_worker() -> None:
         # Start background token refresh thread for Lakebase 1-hour OAuth credentials
         threading.Thread(target=credential_refresh_loop, daemon=True).start()
 
+        preflight_required_tools()
         config_path = render_librechat_yaml()
         ensure_unmodified_librechat_repo()
-        start_embedded_mongodb()
+        start_embedded_mongodb(w)
         start_rag_api_with_lakebase()
         start_librechat_backend(config_path)
     except Exception as exc:
@@ -833,13 +1061,39 @@ async def handle_databricks_health(request: web.Request) -> web.Response:
             },
             "unity_gateway": {
                 "host": STATE.databricks_host,
-                "obo_user_detected": bool(obo_tok or STATE.latest_obo_token),
-                "obo_user_email": obo_email or STATE.latest_obo_email,
-                "models": parse_csv_env("UNITY_GATEWAY_MODELS", ""),
-                "mcp_services": parse_csv_env("UNITY_GATEWAY_MCP_SERVICES", ""),
+                "obo_user_detected": bool(obo_tok),
+                "obo_user_email": obo_email,
+                "obo_users_cached": len(STATE.obo_tokens_by_email),
+                "models": parse_csv_env("UNITY_GATEWAY_MODELS", DEFAULT_CHAT_MODELS),
+                "mcp_services": parse_csv_env("UNITY_GATEWAY_MCP_SERVICES", DEFAULT_MCP_SERVICES),
+                "embedding_model": os.environ.get(
+                    "UNITY_GATEWAY_EMBEDDING_MODEL", DEFAULT_EMBEDDING_MODEL
+                ),
             },
         }
     )
+
+
+def _registration_matches_verified_identity(
+    raw_body: bytes, verified_email: Optional[str]
+) -> bool:
+    """
+    True only when the registration payload's email equals the Databricks-verified
+    email from the Apps reverse proxy. Fails closed on an unparseable body or a
+    missing verified identity.
+    """
+    if not verified_email:
+        return False
+    try:
+        payload = json.loads(raw_body.decode("utf-8"))
+    except Exception:
+        return False
+    if not isinstance(payload, dict):
+        return False
+    claimed = payload.get("email")
+    if not isinstance(claimed, str):
+        return False
+    return claimed.strip().lower() == verified_email.strip().lower()
 
 
 async def handle_ingress_proxy(request: web.Request) -> web.StreamResponse:
@@ -855,6 +1109,27 @@ async def handle_ingress_proxy(request: web.Request) -> web.StreamResponse:
 
     if request.path == "/api/databricks/health":
         return await handle_databricks_health(request)
+
+    # Identity guard: LibreChat self-registration is enabled so the proxy can
+    # auto-provision the signed-in Databricks user, but that would otherwise let
+    # any app-authorized user register an account under a COLLEAGUE's email.
+    # Because OBO tokens are cached per email, that account would then resolve to
+    # the colleague's Unity Gateway token. Only allow a registration whose email
+    # matches the Databricks-verified `x-forwarded-email`.
+    if request.method == "POST" and request.path == "/api/auth/register":
+        raw_body = await request.read()
+        if not _registration_matches_verified_identity(raw_body, obo_email):
+            STATE.add_log(
+                f"Rejected /api/auth/register: email in body does not match verified "
+                f"Databricks identity ({obo_email or 'none'})."
+            )
+            return web.json_response(
+                {
+                    "message": "Registration is restricted to your Databricks identity. "
+                    "Accounts are provisioned automatically on sign-in."
+                },
+                status=403,
+            )
 
     if not STATE.ready:
         return web.Response(text=build_loading_html(), content_type="text/html", status=200)
@@ -971,13 +1246,24 @@ async def handle_ingress_proxy(request: web.Request) -> web.StreamResponse:
 
 async def handle_obo_bridge(request: web.Request) -> web.StreamResponse:
     """
-    Local Unity Gateway OBO proxy on 127.0.0.1:3081.
-    Used by companion processes (such as Python `rag_api` calling Unity Gateway
-    3-level embedding model services) to automatically inject the caller's
-    `x-forwarded-access-token` (or Service Principal fallback token).
+    Local Unity Gateway proxy on 127.0.0.1:3081 for companion processes -- today
+    only the Python `rag_api` calling Unity Gateway embedding model services.
+
+    If the caller identifies a user via `x-librechat-user-email` AND that user
+    has a cached OBO token, the call is made as that user. Otherwise it is made
+    as the app's Service Principal: embeddings issued by the RAG API are NOT
+    user-attributed, which is a deliberate, documented trade-off. It never
+    borrows a different user's token.
     """
     explicit_email = request.headers.get("x-librechat-user-email")
-    token, source = STATE.resolve_obo_or_sp_token(explicit_email)
+    token, source = STATE.resolve_obo_token(explicit_email)
+    if not token:
+        token, source = STATE.sp_token, "SP(app-service-principal)"
+    if not token:
+        return web.json_response(
+            {"error": "No Databricks credential available for Unity Gateway call"},
+            status=503,
+        )
     target_url = f"https://{STATE.databricks_host}{request.rel_url}"
 
     fwd_headers = {
