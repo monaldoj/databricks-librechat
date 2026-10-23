@@ -14,27 +14,6 @@ variables:
     description: "Compute size for the Databricks App (MEDIUM, LARGE, or XLARGE). LibreChat's npm install + Vite frontend build runs in-container on cold start, so XLARGE (48 GB / up to 12 vCPU) is the practical minimum."
     default: "XLARGE"
 
-  lakebase_project_id:
-    description: "Lakebase Autoscaling PostgreSQL project ID (1-63 lowercase alphanumeric/hyphens)"
-    default: "librechat-lakebase"
-
-  lakebase_display_name:
-    description: "Display name for the Lakebase Autoscaling PostgreSQL project"
-    default: "LibreChat Lakebase Autoscaling"
-
-  lakebase_branch:
-    description: "Lakebase branch ID (the default branch created with a project is 'production')"
-    default: "production"
-
-  # NOTE: this is the Lakebase *resource* ID, which is hyphenated, e.g.
-  #   projects/<p>/branches/<b>/databases/databricks-postgres
-  # It is NOT the PostgreSQL database name (`databricks_postgres`, with an
-  # underscore), which the platform injects into the app as PGDATABASE.
-  # Verify with: databricks postgres list-databases projects/<p>/branches/<b>
-  lakebase_database_id:
-    description: "Lakebase database resource ID used in the app's postgres binding (hyphenated, e.g. databricks-postgres)"
-    default: "databricks-postgres"
-
   librechat_version:
     description: "Upstream LibreChat git tag/branch to run unmodified from https://github.com/LibreChat-AI/LibreChat"
     default: "v0.8.8"
@@ -47,6 +26,18 @@ variables:
   mongo_uri:
     description: "MongoDB connection string. A loopback host means use the ephemeral MongoDB embedded in the app container; any other host is treated as external and durable."
     default: "mongodb://127.0.0.1:27017/LibreChat"
+
+  # Same contract as mongo_uri. PostgreSQL backs only the RAG API's pgvector
+  # store (LibreChat itself is MongoDB-only). A loopback host (the default)
+  # means "run the ephemeral PostgreSQL 16 + pgvector embedded in this app
+  # container" -- uploaded-file embeddings are lost whenever the app restarts.
+  # Point this at any PostgreSQL with the pgvector extension available (RDS,
+  # Azure Database for PostgreSQL, Cloud SQL, self-hosted, ...) for a durable
+  # RAG index; the embedded server is then never started. sslmode defaults to
+  # `require` for an external host -- append `?sslmode=...` to override.
+  postgres_uri:
+    description: "PostgreSQL (pgvector) connection string for the RAG API. A loopback host means use the ephemeral PostgreSQL embedded in the app container; any other host is treated as external and durable."
+    default: "postgresql://librechat@127.0.0.1:5432/librechat"
 
   prod_root_path:
     description: "Workspace root path for the prod target. Override with a service-principal path for CI-driven production deploys."
@@ -70,10 +61,10 @@ variables:
 
   unity_gateway_models:
     description: "Comma-separated list of 3-level namespace model services in Unity Gateway (catalog.schema.model_service_name)"
-    default: "system.ai.claude-opus-5-5,system.ai.claude-sonnet-5-5,system.ai.claude-haiku-5-5,system.ai.gpt-5-6-sol"
+    default: "system.ai.databricks-gemini-4-argon,system.ai.gpt-6-1-sol,system.ai.gpt-6-sol,system.ai.gpt-6-luna,system.ai.gpt-6-astra,system.ai.gpt-5-6-sol,system.ai.gpt-5-6-terra,system.ai.gpt-5-6-luna,system.ai.gpt-5-5-pro,system.ai.gpt-5-5,system.ai.gpt-5-4,system.ai.gpt-5-4-mini,system.ai.gpt-5-4-nano,system.ai.gpt-5-3-codex,system.ai.gpt-5-2,system.ai.gpt-5-1,system.ai.gpt-5,system.ai.gpt-5-mini,system.ai.gpt-5-nano,system.ai.gemini-3-8-flash,system.ai.gemini-3-7-flash,system.ai.gemini-3-6-flash,system.ai.gemini-3-5-flash,system.ai.gemini-3-5-flash-lite,system.ai.gemini-3-1-pro,system.ai.gemini-3-1-flash-image,system.ai.gemini-3-1-flash-lite,system.ai.gemini-3-pro-image,system.ai.gemini-3-flash,system.ai.openjev-qwen35-4b,system.ai.typesafeai-jev-1-14-0,system.ai.qwen35-122b-a10b,system.ai.qwen3-embedding-0-6b,system.ai.qwen3-next-80b-a3b-instruct,system.ai.grok-4-7,system.ai.grok-4-6,system.ai.glm-5-3,system.ai.glm-5-3-flash,system.ai.glm-5-2,system.ai.kimi-k3,system.ai.deepseek-v4-1-flash-1017,system.ai.deepseek-v4-1-flash,system.ai.deepseek-v4-pro-0813,system.ai.deepseek-v4-flash-0731,system.ai.gpt-oss-120b,system.ai.gpt-oss-20b,system.ai.gemma-3-12b,system.ai.llama-4-maverick,system.ai.meta-llama-3-3-70b-instruct,system.ai.meta-llama-3-1-8b-instruct,system.ai.claude-haiku-5-5,system.ai.claude-haiku-4-5,system.ai.claude-sonnet-5-5,system.ai.claude-sonnet-5,system.ai.claude-sonnet-4-6,system.ai.claude-sonnet-4-5,system.ai.claude-fable-5-1,system.ai.claude-fable-5,system.ai.claude-opus-5-5,system.ai.claude-opus-5,system.ai.claude-opus-4-8,system.ai.claude-opus-4-7,system.ai.claude-opus-4-6,system.ai.claude-opus-4-5,system.ai.claude-opus-4-1,system.ai.inkling,system.ai.gte-large-en,system.ai.bge-large-en"
 
   unity_gateway_embedding_model:
-    description: "3-level namespace embedding model service used by LibreChat's RAG API + Lakebase pgvector"
+    description: "3-level namespace embedding model service used by LibreChat's RAG API + PostgreSQL pgvector"
     default: "system.ai.gte-large-en"
 
   unity_gateway_title_model:
@@ -90,7 +81,6 @@ targets:
     default: true
     variables:
       app_name: "librechat-dev"
-      lakebase_project_id: "librechat-lakebase-dev"
 
   prod:
     mode: production
@@ -105,4 +95,3 @@ targets:
       root_path: ${var.prod_root_path}
     variables:
       app_name: "librechat"
-      lakebase_project_id: "librechat-lakebase"

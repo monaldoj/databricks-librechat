@@ -9,3 +9,7 @@ PyYAML==6.0.2
 # Used to serve LibreChat's companion RAG API (uvicorn was previously invoked
 # but never declared, and only arrived via the RAG API's own requirements).
 uvicorn==0.38.0
+# PostgreSQL 16 + pgvector 0.6.2 binaries for the ephemeral in-container
+# PostgreSQL used when POSTGRES_URI is loopback (the default). Only its bundled
+# `initdb`/`postgres` binaries are used -- see `embedded_postgres_bin_dir`.
+pgserver==0.1.4

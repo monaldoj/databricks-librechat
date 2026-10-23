@@ -8,10 +8,14 @@ Bundle (DAB)**, wired to:
    three-level Unity Catalog namespaces (`catalog.schema.service_name`), using
    **On-Behalf-Of (OBO)** user authentication so every model and MCP call inherits the
    signed-in Databricks user's permissions, rate limits, guardrails and audit lineage.
-2. **Lakebase Autoscaling (PostgreSQL 17 + `pgvector`)** for LibreChat's PostgreSQL
-   dependency — the RAG / file-search vector store.
+2. **PostgreSQL + `pgvector`** for LibreChat's PostgreSQL dependency — the RAG / file-search
+   vector store. By default an **ephemeral** PostgreSQL 16 runs inside the app container;
+   point `postgres_uri` at any PostgreSQL you host for a durable index.
 3. **MongoDB** for LibreChat's own database. By default an **ephemeral** `mongod` runs inside
    the app container; point `mongo_uri` at a managed MongoDB for durable history.
+
+No Lakebase is required, so this deploys into workspaces without Lakebase access (for
+example, compliance-security-profile workspaces).
 
 Nothing in LibreChat's source is modified. All integration happens through environment
 variables, a rendered `librechat.yaml`, and a Node `--require` preload hook.
@@ -22,27 +26,37 @@ variables, a rendered `librechat.yaml`, and a Node `--require` preload hook.
 
 **LibreChat cannot use PostgreSQL as its primary database.** LibreChat v0.8.8 is
 mongoose/MongoDB-only — there is no `postgres`, `drizzle`, `prisma` or `sequelize` code
-anywhere in the repository. So Lakebase serves LibreChat's *one* PostgreSQL dependency, the
-RAG API's `pgvector` store. Making Lakebase the primary store would mean forking LibreChat's
+anywhere in the repository. So PostgreSQL serves LibreChat's *one* PostgreSQL dependency, the
+RAG API's `pgvector` store. Making PostgreSQL the primary store would mean forking LibreChat's
 data layer, which defeats the "run it unmodified" goal.
 
-**What that means for your data, with the default `mongo_uri`:**
+**What that means for your data, with the default `mongo_uri` and `postgres_uri`:**
 
 | Data | Where it lives | Survives an app restart? |
 |------|----------------|--------------------------|
 | Conversations, users, agents, prompts, presets, files metadata | Embedded MongoDB (`/tmp`) | **No** |
-| RAG / file-search embeddings | Lakebase PostgreSQL + `pgvector` | Yes |
+| RAG / file-search embeddings | Embedded PostgreSQL + `pgvector` (`/tmp`) | **No** |
 
-Set the `mongo_uri` variable to an external managed MongoDB to make everything durable:
+Point either variable at a server you host to make that store durable:
 
 ```bash
 databricks bundle deploy -t prod -p <profile> \
-  --var="mongo_uri=mongodb+srv://<user>:<pw>@<cluster>.mongodb.net/LibreChat?retryWrites=true"
+  --var="mongo_uri=mongodb+srv://<user>:<pw>@<cluster>.mongodb.net/LibreChat?retryWrites=true" \
+  --var="postgres_uri=postgresql://<user>:<pw>@<host>:5432/<db>?sslmode=require"
 ```
 
-The app detects a non-loopback host, skips the embedded `mongod` entirely, and uses your
-connection string verbatim. That is the only change needed, and once it is in place
-`compute_max_instances` can safely be raised above 1.
+For each one, the app detects a non-loopback host, skips the embedded server entirely, and
+uses your connection string as-is. That is the only change needed. Once **both** are
+external, `compute_max_instances` can safely be raised above 1.
+
+The external PostgreSQL must have the `pgvector` extension available. The app runs
+`CREATE SCHEMA IF NOT EXISTS librechat` and `CREATE EXTENSION IF NOT EXISTS vector` on
+startup; if its role may not create extensions, have an administrator run the latter once.
+`sslmode` defaults to `require` for an external host; add `?sslmode=...` to override.
+
+> **Keep credentials out of plain env values.** Both URIs carry a password. For a real
+> deployment, store them in a Databricks secret scope, attach the secret as an app resource,
+> and reference it with `valueFrom` instead of `value` in `resources/librechat.app.yml`.
 
 ---
 
@@ -53,7 +67,7 @@ connection string verbatim. That is the only change needed, and once it is in pl
    databricks --version
    databricks auth profiles
    ```
-2. A workspace with **Databricks Apps**, **Lakebase Autoscaling** and **Unity Gateway** enabled.
+2. A workspace with **Databricks Apps** and **Unity Gateway** enabled. Lakebase is not used.
 3. **Outbound network access** from the app container. LibreChat is cloned and built at
    startup, so in an egress-restricted workspace these must be allowlisted in the egress
    policy — and the app **restarted afterwards**, since egress changes need a restart:
@@ -64,7 +78,7 @@ connection string verbatim. That is the only change needed, and once it is in pl
    | `registry.npmjs.org` | `npm ci` and the frontend build |
    | `nodejs.org` | a build-capable Node, if the container's own is too old (first cold start only — then cached in the UC Volume) |
    | `fastdl.mongodb.org` | the `mongod` binary (first cold start only — then cached in the UC Volume) |
-   | `pypi.org` | the RAG API's Python dependencies |
+   | `pypi.org` | the RAG API's Python dependencies, and `pgserver` (the embedded PostgreSQL binaries) at deploy time |
 
 4. Permission to create a schema and volume in the catalog named by `state_catalog`
    (default `justinm_demo`).
@@ -77,7 +91,7 @@ connection string verbatim. That is the only change needed, and once it is in pl
 # 1. Validate
 databricks bundle validate --strict -t dev -p <profile>
 
-# 2. Deploy and start (this creates the app, Lakebase project, schema and volume)
+# 2. Deploy and start (this creates the app, schema and volume)
 databricks bundle deploy -t dev -p <profile>
 
 # 3. Watch it come up — the first boot builds LibreChat from source
@@ -88,7 +102,7 @@ databricks apps logs librechat-dev --follow -p <profile>
 returns a URL; you do not need a separate `bundle run`. (`databricks apps logs` requires
 OAuth auth, not a PAT.)
 
-While LibreChat is building, the app serves a live status page showing progress for Lakebase,
+While LibreChat is building, the app serves a live status page showing progress for PostgreSQL,
 MongoDB, the RAG API and Unity Gateway. `GET /api/databricks/health` returns the same state
 as JSON.
 
@@ -306,7 +320,6 @@ databricks bundle deploy -t dev -p <profile> \
 .
 ├── databricks.yml                        # Bundle config and all tunable variables
 ├── resources/
-│   ├── lakebase.postgres.yml             # Lakebase Autoscaling Postgres 17 project & branch
 │   ├── librechat_state.schema.yml        # UC schema for cached runtime artifacts
 │   ├── librechat_state.volume.yml        # UC Volume caching the mongod binary
 │   └── librechat.app.yml                 # App resource, OBO scopes, runtime config, bindings
@@ -315,7 +328,7 @@ databricks bundle deploy -t dev -p <profile> \
     ├── librechat.yaml                    # LibreChat config template (rendered at startup)
     ├── requirements.txt                  # Pinned Python dependencies
     └── scripts/
-        ├── start_app.py                  # Orchestrator: ingress proxy, Lakebase, Mongo, RAG, LibreChat
+        ├── start_app.py                  # Orchestrator: ingress proxy, Postgres, Mongo, RAG, LibreChat
         ├── start_mongodb.cjs             # Embedded ephemeral MongoDB launcher
         └── databricks_obo_preload.cjs    # Node preload hook injecting per-user OBO tokens
 ```
@@ -327,35 +340,34 @@ databricks bundle deploy -t dev -p <profile> \
 ### 1. Zero changes to LibreChat
 
 `start_app.py` clones `LibreChat-AI/LibreChat` at `LIBRECHAT_VERSION` and runs it as-is.
-Integration is entirely via environment variables (`MONGO_URI`, `DATABASE_URL`, `POSTGRES_*`,
-`CONFIG_PATH`), a rendered `/tmp/librechat.yaml`, and
+Integration is entirely via environment variables (`MONGO_URI`, `CONFIG_PATH`, and the
+RAG API's `DB_HOST` / `POSTGRES_*`), a rendered `/tmp/librechat.yaml`, and
 `NODE_OPTIONS="--require scripts/databricks_obo_preload.cjs"`.
 
-### 2. Lakebase for PostgreSQL
+### 2. PostgreSQL for the RAG API
 
-Attaching the `postgres` app resource makes the platform inject `PGHOST`, `PGPORT`,
-`PGDATABASE`, `PGUSER`, `PGSSLMODE=require` and `LAKEBASE_ENDPOINT`. The orchestrator calls
-`w.postgres.generate_database_credential(endpoint=os.environ["LAKEBASE_ENDPOINT"])` to mint a
-1-hour OAuth token, creates the `librechat` schema and the `vector` extension, and builds:
+`POSTGRES_URI` follows the same contract as `MONGO_URI`. The orchestrator parses it into the
+discrete settings the RAG API reads (`DB_HOST`, `DB_PORT`, `POSTGRES_DB`, `POSTGRES_USER`,
+`POSTGRES_PASSWORD`, `PGSSLMODE`), then creates the `librechat` schema and `vector`
+extension.
 
-```text
-postgresql://<PGUSER>:<OAUTH_TOKEN>@<PGHOST>:5432/<PGDATABASE>?sslmode=require
-```
+With a loopback host (the default, `postgresql://librechat@127.0.0.1:5432/librechat`) it
+runs an **ephemeral PostgreSQL 16.2 + pgvector 0.6.2** as a separate process in the app
+container:
 
-A background loop re-mints the token every 40 minutes and **restarts the RAG API** so the
-child process picks up the new password — refreshing this process's environment alone is not
-enough, and without the restart Lakebase auth silently breaks about an hour in.
+- The binaries come from the [`pgserver`](https://pypi.org/project/pgserver/) wheel in
+  `requirements.txt`, so the platform's normal `pip install` provides them. No apt, no root,
+  and no runtime download (unlike `mongod`, which needs `fastdl.mongodb.org`). Only its
+  bundled `initdb` / `postgres` binaries are used, because pgserver's own launcher listens
+  on a unix socket only and the RAG API needs TCP.
+- Data lives in `/tmp/librechat-postgres`. TCP is bound to the loopback host only and needs
+  a password (`scram-sha-256`); the password is taken from the URI or generated each boot.
+  Trust auth applies only over the unix socket inside the `0700` data directory.
+- PostgreSQL refuses to run as root, and the wheel ships `x86_64` Linux binaries only.
+- A failure here is **non-fatal**: RAG / file search is disabled, and LibreChat still starts.
 
-> **Two different database names.** The Lakebase *resource* ID is hyphenated
-> (`.../databases/databricks-postgres`) while the *PostgreSQL* database name is underscored
-> (`databricks_postgres`). The app binding needs the hyphenated resource ID; `PGDATABASE`
-> gets the underscored name automatically. Confirm with:
-> `databricks postgres list-databases projects/<project>/branches/<branch> -p <profile>`
-
-> **Deploy before you connect locally.** The app's service principal has
-> `CAN_CONNECT_AND_CREATE`, which lets it create objects but not use schemas owned by someone
-> else. It must create the `librechat` schema itself to own it. If you connect with your own
-> credentials first and create that schema, the SP will hit `permission denied ... 42501`.
+Databricks Apps has no sidecar containers, so "separate container" really means a separate
+process on the same compute, exactly as with the embedded `mongod`.
 
 ### 3. MongoDB
 
@@ -502,7 +514,7 @@ Re-rendering is idempotent, so these never accumulate duplicates.
   `[Errno 2] No such file or directory: '.venv/bin/python'` — which is how the RAG API
   silently degraded to `rag_api: warning`. `PYTHON_EXECUTABLE` is resolved once at import,
   while the cwd is still the app root, and used for every child process.
-- **Check `/api/databricks/health` first.** It reports Lakebase, MongoDB, RAG API and OBO
+- **Check `/api/databricks/health` first.** It reports PostgreSQL, MongoDB, RAG API and OBO
   state in one place, and surfaces partial failures (like the one above) that the UI hides.
 
 ## Known limitations
@@ -512,7 +524,7 @@ Re-rendering is idempotent, so these never accumulate duplicates.
   over SSE, so a single generation longer than 120s returns a 504 **generated at the proxy,
   with nothing in the app logs**. Long agent/tool loops over the MCP servers are the most
   likely way to hit this.
-- **One instance only** while MongoDB is embedded. Each replica would have its own database
+- **One instance only** while MongoDB or PostgreSQL is embedded. Each replica would have its own database
   and its own per-boot JWT secret, so sessions and history would break at random. Pinned via
   `compute_min_instances: 1` / `compute_max_instances: 1`.
 - **Session secrets are regenerated on every boot.** Correct while MongoDB is ephemeral
@@ -534,6 +546,6 @@ Re-rendering is idempotent, so these never accumulate duplicates.
 curl -s https://<app-url>/api/databricks/health | jq
 ```
 
-Reports `ready`/`phase`, Lakebase status and host, MongoDB status (`running (ephemeral)` vs
+Reports `ready`/`phase`, PostgreSQL status, host and whether it is embedded, MongoDB status (`running (ephemeral)` vs
 `external`), RAG API status, and the resolved Unity Gateway host, models, embedding model,
 MCP services, and whether an OBO user token was seen on the request.

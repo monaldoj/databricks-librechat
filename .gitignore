@@ -25,7 +25,7 @@ env/
 .ruff_cache/
 .mypy_cache/
 
-# Node.js / Embedded MongoDB / Local LibreChat Checkouts
+# Node.js / Embedded MongoDB & PostgreSQL / Local LibreChat Checkouts
 node_modules/
 npm-debug.log*
 yarn-debug.log*
@@ -34,6 +34,7 @@ pnpm-debug.log*
 .npm/
 mongodb-binaries/
 librechat-mongodb/
+librechat-postgres/
 librechat/
 librechat-rag-api/
 

@@ -6,9 +6,12 @@ Runs inside a Databricks App container and coordinates:
 1. Immediate HTTP/SSE/WebSocket ingress on `DATABRICKS_APP_PORT` (default 8000)
    that captures `x-forwarded-access-token` and `x-forwarded-email` for
    On-Behalf-Of (OBO) authentication to Databricks Unity Gateway.
-2. Lakebase Autoscaling PostgreSQL connection string generation (`PGHOST`, `PGPORT`,
-   `PGDATABASE`, `PGUSER`, `PGSSLMODE=require`, OAuth credential via `LAKEBASE_ENDPOINT`)
-   and `pgvector` + schema initialization.
+2. PostgreSQL connectivity for the RAG API's `pgvector` store. If `POSTGRES_URI`
+   names a non-loopback host it is used verbatim (point it at a managed PostgreSQL
+   for durable embeddings). Otherwise an ephemeral PostgreSQL 16 + pgvector server
+   is started on `127.0.0.1:5432` inside this container, and the RAG index is lost
+   when the app restarts. Either way the `librechat` schema and `vector` extension
+   are initialized.
 3. MongoDB connectivity. If `MONGO_URI` is set it is used verbatim (point it at a
    managed MongoDB for durable history). If it is empty, an ephemeral `mongod` is
    started on `127.0.0.1:27017` inside this container and ALL LibreChat state --
@@ -16,7 +19,7 @@ Runs inside a Databricks App container and coordinates:
 4. Dynamic rendering of `/tmp/librechat.yaml` with 3-level Unity Catalog namespace
    Model Services (`catalog.schema.model_service_name`) and MCP Services
    (`catalog.schema.mcp_service_name`) routed through Databricks Unity Gateway.
-5. Unmodified `LibreChat-AI/LibreChat` (and `LibreChat-AI/rag-api` backed by Lakebase
+5. Unmodified `LibreChat-AI/LibreChat` (and `LibreChat-AI/rag-api` backed by
    PostgreSQL `pgvector`), with only connection strings and `CONFIG_PATH` configured
    through environment variables.
 """
@@ -28,6 +31,7 @@ import collections
 import hashlib
 import hmac
 import html
+import importlib.util
 import json
 import logging
 import os
@@ -47,6 +51,7 @@ try:
     import aiohttp
     from aiohttp import web
     import psycopg2
+    from psycopg2 import sql
     import yaml
     from databricks.sdk import WorkspaceClient
 except ModuleNotFoundError as _exc:  # pragma: no cover - startup diagnostics only
@@ -166,10 +171,10 @@ EMBEDDED_MONGO_URI = "mongodb://127.0.0.1:27017/LibreChat"
 _LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1", "[::1]", "0.0.0.0"}
 
 
-def _mongo_uri_is_loopback(uri: str) -> bool:
+def _uri_is_loopback(uri: str, schemes: tuple) -> bool:
     """
     True when `uri` points at this container, i.e. we are expected to start the
-    embedded ephemeral mongod. Any other host is an external, durable MongoDB
+    embedded ephemeral database. Any other host is an external, durable database
     that we must not try to manage.
     """
     if not uri:
@@ -178,14 +183,24 @@ def _mongo_uri_is_loopback(uri: str) -> bool:
         parsed = urllib.parse.urlsplit(uri)
     except Exception:
         return False
-    if parsed.scheme not in ("mongodb", "mongodb+srv"):
+    if parsed.scheme not in schemes:
         return False
     hosts = (parsed.netloc.rsplit("@", 1)[-1]).split(",")
     return all((h.rsplit(":", 1)[0] or "").strip().lower() in _LOOPBACK_HOSTS for h in hosts if h)
 
 
 MONGO_URI = (os.environ.get("MONGO_URI") or "").strip() or EMBEDDED_MONGO_URI
-USE_EMBEDDED_MONGO = _mongo_uri_is_loopback(MONGO_URI)
+USE_EMBEDDED_MONGO = _uri_is_loopback(MONGO_URI, ("mongodb", "mongodb+srv"))
+
+# PostgreSQL backs only the RAG API's pgvector store (LibreChat itself is
+# MongoDB-only). Same contract as MONGO_URI: a loopback host means run the
+# ephemeral PostgreSQL embedded in this container; any other host is an
+# external, durable PostgreSQL used as-is.
+EMBEDDED_POSTGRES_URI = "postgresql://librechat@127.0.0.1:5432/librechat"
+_POSTGRES_SCHEMES = ("postgresql", "postgres")
+POSTGRES_URI = (os.environ.get("POSTGRES_URI") or "").strip() or EMBEDDED_POSTGRES_URI
+USE_EMBEDDED_POSTGRES = _uri_is_loopback(POSTGRES_URI, _POSTGRES_SCHEMES)
+POSTGRES_DATA_DIR = Path(os.environ.get("POSTGRES_EMBEDDED_DATA_DIR", "/tmp/librechat-postgres"))
 
 # UC Volume used to cache the mongod binary between cold starts, so startup does
 # not depend on egress to fastdl.mongodb.org every time.
@@ -246,12 +261,10 @@ class AppState:
         self.logs: Deque[str] = collections.deque(maxlen=250)
 
         # Component statuses
-        self.lakebase_status: str = "pending"
-        self.lakebase_host: str = os.environ.get("PGHOST", "")
-        self.lakebase_db: str = os.environ.get("PGDATABASE", "databricks_postgres")
-        self.lakebase_endpoint: str = os.environ.get("LAKEBASE_ENDPOINT", "")
-        self.lakebase_token: str = ""
-        self.database_url: str = ""
+        self.postgres_status: str = "pending"
+        self.postgres_is_embedded: bool = USE_EMBEDDED_POSTGRES
+        # host, port, dbname, user, password, sslmode -- see `parse_postgres_uri`
+        self.postgres: Dict[str, str] = {}
 
         self.mongodb_status: str = "pending"
         self.mongo_uri: str = EMBEDDED_MONGO_URI if USE_EMBEDDED_MONGO else MONGO_URI
@@ -281,6 +294,7 @@ class AppState:
 
         # Subprocesses
         self.mongo_proc: Optional[subprocess.Popen] = None
+        self.postgres_proc: Optional[subprocess.Popen] = None
         self.rag_proc: Optional[subprocess.Popen] = None
         self.librechat_proc: Optional[subprocess.Popen] = None
 
@@ -348,7 +362,7 @@ STATE = AppState()
 
 
 # =============================================================================
-# 1. Databricks Workspace, Unity Gateway & Lakebase Credential Management
+# 1. Databricks Workspace, Unity Gateway & PostgreSQL Credential Management
 # =============================================================================
 def normalize_host(raw: str) -> str:
     h = (raw or "").strip()
@@ -374,123 +388,79 @@ def init_databricks_workspace_and_sp_token(w: WorkspaceClient) -> None:
     STATE.add_log(f"Authenticated Databricks WorkspaceClient for host: {host}")
 
 
-def refresh_lakebase_connection_string(w: WorkspaceClient, initialize_schema: bool = False) -> None:
+def parse_postgres_uri(uri: str) -> Dict[str, str]:
     """
-    Mints a fresh Lakebase Autoscaling OAuth token and builds the standard
-    PostgreSQL connection string for LibreChat and its RAG API.
+    Splits a `postgresql://<user>:<password>@<host>:<port>/<dbname>?sslmode=...` URI into
+    the discrete settings the RAG API reads (`DB_HOST`, `POSTGRES_DB`, ...).
+
+    `sslmode` defaults to `disable` for the embedded server (built without TLS,
+    and only reachable on loopback) and to `require` for an external one.
     """
-    pg_host = os.environ.get("PGHOST", "").strip()
-    pg_port = os.environ.get("PGPORT", "5432").strip()
-    pg_db = os.environ.get("PGDATABASE", "databricks_postgres").strip()
-    pg_user = os.environ.get("PGUSER", "").strip()
-    endpoint = os.environ.get("LAKEBASE_ENDPOINT", "").strip()
-
-    STATE.lakebase_host = pg_host
-    STATE.lakebase_db = pg_db
-    STATE.lakebase_endpoint = endpoint
-
-    if not pg_host:
-        STATE.lakebase_status = "not_configured"
-        STATE.add_log("PGHOST not found in environment; skipping Lakebase initialization.")
-        return
-
-    token = os.environ.get("PGPASSWORD", "").strip()
-    if endpoint:
-        STATE.add_log(f"Generating Lakebase OAuth credential for endpoint: {endpoint}")
-        cred = w.postgres.generate_database_credential(endpoint=endpoint)
-        token = cred.token
-    elif not token:
-        # Fallback to workspace OAuth token if LAKEBASE_ENDPOINT was not explicitly set
-        token = STATE.sp_token
-
-    if not pg_user:
-        pg_user = os.environ.get("DATABRICKS_CLIENT_ID") or w.current_user.me().user_name
-
-    STATE.lakebase_token = token
-    quoted_user = urllib.parse.quote_plus(pg_user)
-    quoted_pw = urllib.parse.quote_plus(token)
-    quoted_db = urllib.parse.quote_plus(pg_db)
-
-    # The ONLY thing that changes from LibreChat's perspective for PostgreSQL
-    # is the connection string pointing to the Lakebase Autoscaling project:
-    conn_str = f"postgresql://{quoted_user}:{quoted_pw}@{pg_host}:{pg_port}/{quoted_db}?sslmode=require"
-    STATE.database_url = conn_str
-
-    os.environ["DATABASE_URL"] = conn_str
-    os.environ["POSTGRES_URI"] = conn_str
-    os.environ["DB_HOST"] = pg_host
-    os.environ["DB_PORT"] = pg_port
-    os.environ["POSTGRES_DB"] = pg_db
-    os.environ["POSTGRES_USER"] = pg_user
-    os.environ["POSTGRES_PASSWORD"] = token
-    os.environ["PGSSLMODE"] = "require"
-
-    if initialize_schema:
-        STATE.add_log(f"Connecting to Lakebase PostgreSQL at {pg_host}:{pg_port}/{pg_db} (sslmode=require)...")
-        conn = psycopg2.connect(
-            host=pg_host,
-            port=int(pg_port),
-            dbname=pg_db,
-            user=pg_user,
-            password=token,
-            sslmode="require",
-            connect_timeout=15,
+    parsed = urllib.parse.urlsplit(uri)
+    if parsed.scheme not in _POSTGRES_SCHEMES:
+        raise ValueError(
+            f"POSTGRES_URI must start with postgresql:// (got scheme {parsed.scheme!r})"
         )
-        conn.autocommit = True
+    if not parsed.hostname:
+        raise ValueError("POSTGRES_URI has no host")
+    query = urllib.parse.parse_qs(parsed.query)
+    embedded = _uri_is_loopback(uri, _POSTGRES_SCHEMES)
+    return {
+        "host": parsed.hostname,
+        "port": str(parsed.port or 5432),
+        "dbname": urllib.parse.unquote(parsed.path.lstrip("/")) or "postgres",
+        "user": urllib.parse.unquote(parsed.username or "postgres"),
+        "password": urllib.parse.unquote(parsed.password or ""),
+        "sslmode": (query.get("sslmode") or ["disable" if embedded else "require"])[0],
+    }
+
+
+def initialize_postgres_schema() -> None:
+    """Creates the `librechat` schema and `vector` extension the RAG API expects."""
+    pg = STATE.postgres
+    where = f"{pg['host']}:{pg['port']}/{pg['dbname']}"
+    STATE.add_log(f"Connecting to PostgreSQL at {where} (sslmode={pg['sslmode']})...")
+    conn = psycopg2.connect(
+        host=pg["host"],
+        port=int(pg["port"]),
+        dbname=pg["dbname"],
+        user=pg["user"],
+        password=pg["password"],
+        sslmode=pg["sslmode"],
+        connect_timeout=15,
+    )
+    conn.autocommit = True
+    try:
         with conn.cursor() as cur:
             cur.execute("SELECT version();")
             ver = cur.fetchone()[0]
-            STATE.add_log(f"Connected to Lakebase PostgreSQL: {ver.split(',')[0]}")
+            STATE.add_log(f"Connected to PostgreSQL: {ver.split(',')[0]}")
             cur.execute("CREATE SCHEMA IF NOT EXISTS librechat;")
-            STATE.add_log("Ensured PostgreSQL schema `librechat` exists in Lakebase.")
+            STATE.add_log("Ensured PostgreSQL schema `librechat` exists.")
             try:
                 cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
-                STATE.add_log("Ensured PostgreSQL `vector` (pgvector) extension is enabled in Lakebase.")
+                STATE.add_log("Ensured PostgreSQL `vector` (pgvector) extension is enabled.")
             except Exception as ext_err:
+                # Common on a managed PostgreSQL where the app's role may not
+                # create extensions; an administrator must run it once.
                 STATE.add_log(f"Note on pgvector extension check: {ext_err}")
+    finally:
         conn.close()
-        STATE.lakebase_status = "connected"
 
 
 def credential_refresh_loop() -> None:
     """
-    Refreshes the Service Principal token and the Lakebase 1-hour OAuth token
-    every 40 minutes, then restarts the RAG API so it picks up the new password.
-
-    Refreshing `os.environ` in this process is not enough: `rag_api` is a child
-    process that captured the old password in its environment at spawn time, so
-    without the restart its Lakebase connections start failing about an hour in
-    and never recover.
+    Refreshes the Service Principal token every 40 minutes. It backs the Unity
+    Gateway SP fallback in the Node preload hook and the loopback OBO bridge.
     """
     while True:
         time.sleep(40 * 60)
         try:
             w = WorkspaceClient()
             init_databricks_workspace_and_sp_token(w)
-            refresh_lakebase_connection_string(w, initialize_schema=False)
-            STATE.add_log("Refreshed Databricks Service Principal & Lakebase OAuth tokens.")
-            restart_rag_api()
+            STATE.add_log("Refreshed Databricks Service Principal token.")
         except Exception as exc:
             logger.warning("Periodic token refresh warning: %s", exc)
-
-
-def restart_rag_api() -> None:
-    """Restarts the stateless RAG API so it re-reads the refreshed Lakebase credential."""
-    proc = STATE.rag_proc
-    if proc is None or proc.poll() is not None:
-        return
-    STATE.add_log("Restarting RAG API to pick up the refreshed Lakebase credential...")
-    try:
-        proc.terminate()
-        try:
-            proc.wait(timeout=15)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait(timeout=10)
-    except Exception as exc:
-        STATE.add_log(f"RAG API shutdown note: {exc}")
-    STATE.rag_proc = None
-    start_rag_api_with_lakebase()
 
 
 # =============================================================================
@@ -1065,18 +1035,165 @@ def start_embedded_mongodb(w: WorkspaceClient) -> None:
     save_mongod_binary_cache(w)
 
 
-def start_rag_api_with_lakebase() -> None:
+def embedded_postgres_bin_dir() -> Path:
     """
-    Starts LibreChat's official companion `rag_api` connected to the Lakebase
-    Autoscaling PostgreSQL instance (`DB_HOST`, `POSTGRES_DB`, `POSTGRES_USER`,
-    `POSTGRES_PASSWORD`, `PGSSLMODE=require`) and Unity Gateway embeddings.
+    PostgreSQL 16 + pgvector binaries shipped inside the `pgserver` wheel from
+    requirements.txt, so no apt, root or extra egress is needed. Only the
+    binaries are used: pgserver's own launcher listens on a unix socket only,
+    and the RAG API needs TCP.
     """
-    if STATE.lakebase_status != "connected":
-        STATE.rag_api_status = "skipped (Lakebase not configured)"
+    spec = importlib.util.find_spec("pgserver")
+    if spec is None or not spec.submodule_search_locations:
+        raise RuntimeError("The `pgserver` package is not installed; check app/requirements.txt.")
+    bin_dir = Path(list(spec.submodule_search_locations)[0]) / "pginstall" / "bin"
+    if not (bin_dir / "postgres").exists():
+        raise RuntimeError(f"No postgres binary found under {bin_dir}")
+    return bin_dir
+
+
+def start_embedded_postgres() -> None:
+    """
+    Runs `postgres` on the loopback host/port named by POSTGRES_URI, with its
+    data directory in /tmp. Password auth over TCP; trust only over the unix
+    socket, which lives inside the 0700 data directory.
+    """
+    pg = STATE.postgres
+    STATE.phase = f"Starting embedded ephemeral PostgreSQL on {pg['host']}:{pg['port']}..."
+    STATE.postgres_status = "starting"
+    STATE.add_log(
+        "POSTGRES_URI is loopback: starting an EPHEMERAL in-container PostgreSQL + pgvector. "
+        "The RAG / file-search index is lost when this app restarts. Set the `postgres_uri` "
+        "bundle variable to an external PostgreSQL for durable embeddings."
+    )
+
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        raise RuntimeError("PostgreSQL refuses to run as root, and this app is running as root.")
+
+    if not pg["password"]:
+        # Nothing outside this container ever connects, so a per-boot secret is enough.
+        pg["password"] = secrets.token_hex(24)
+
+    bin_dir = embedded_postgres_bin_dir()
+    if not (POSTGRES_DATA_DIR / "PG_VERSION").exists():
+        shutil.rmtree(POSTGRES_DATA_DIR, ignore_errors=True)
+        pwfile = Path("/tmp/librechat-postgres.pw")
+        pwfile.touch(mode=0o600)
+        pwfile.write_text(pg["password"], encoding="utf-8")
+        try:
+            run_cmd_logged(
+                [
+                    str(bin_dir / "initdb"),
+                    "-D",
+                    str(POSTGRES_DATA_DIR),
+                    "-U",
+                    pg["user"],
+                    f"--pwfile={pwfile}",
+                    "--encoding=UTF8",
+                    "--auth-local=trust",
+                    "--auth-host=scram-sha-256",
+                ],
+                cwd=Path("/tmp"),
+                prefix="postgres-initdb",
+            )
+        finally:
+            pwfile.unlink(missing_ok=True)
+
+    if wait_for_tcp_port(pg["host"], int(pg["port"]), timeout_sec=1.0):
+        STATE.add_log(f"Embedded PostgreSQL is already listening on {pg['host']}:{pg['port']}")
+    else:
+        proc = subprocess.Popen(
+            [
+                str(bin_dir / "postgres"),
+                "-D",
+                str(POSTGRES_DATA_DIR),
+                "-h",
+                pg["host"],
+                "-p",
+                pg["port"],
+                "-k",
+                str(POSTGRES_DATA_DIR),
+            ],
+            cwd=str(POSTGRES_DATA_DIR),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        STATE.postgres_proc = proc
+        stream_process_logs(proc, "postgres")
+        if not wait_for_tcp_port(pg["host"], int(pg["port"]), timeout_sec=60.0):
+            raise RuntimeError(
+                f"Embedded PostgreSQL failed to bind {pg['host']}:{pg['port']} within 60s"
+            )
+
+    # A data directory reused from an earlier boot of this container still has
+    # that boot's password, so (re)set it -- and create the database -- over
+    # the trusted unix socket.
+    deadline = time.time() + 30
+    while True:
+        try:
+            conn = psycopg2.connect(
+                host=str(POSTGRES_DATA_DIR),
+                port=int(pg["port"]),
+                dbname="postgres",
+                user=pg["user"],
+                connect_timeout=5,
+            )
+            break
+        except psycopg2.OperationalError:
+            # "the database system is starting up"
+            if time.time() > deadline:
+                raise
+            time.sleep(1)
+    conn.autocommit = True
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                sql.SQL("ALTER ROLE {} PASSWORD %s").format(sql.Identifier(pg["user"])),
+                (pg["password"],),
+            )
+            cur.execute("SELECT 1 FROM pg_database WHERE datname = %s", (pg["dbname"],))
+            if cur.fetchone() is None:
+                cur.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(pg["dbname"])))
+    finally:
+        conn.close()
+    STATE.add_log(f"Embedded PostgreSQL ready at {pg['host']}:{pg['port']}/{pg['dbname']}")
+
+
+def setup_postgres() -> None:
+    """
+    Non-fatal: PostgreSQL backs only RAG / file search, so a failure here
+    disables that feature instead of blocking LibreChat startup.
+    """
+    try:
+        STATE.postgres = parse_postgres_uri(POSTGRES_URI)
+        if USE_EMBEDDED_POSTGRES:
+            start_embedded_postgres()
+        else:
+            STATE.add_log(
+                f"POSTGRES_URI points at an external PostgreSQL ({STATE.postgres['host']}); "
+                "skipping the embedded server. The RAG index is durable."
+            )
+        initialize_postgres_schema()
+        STATE.postgres_status = "running (ephemeral)" if USE_EMBEDDED_POSTGRES else "external"
+    except Exception as exc:
+        reason = str(exc).strip()
+        STATE.postgres_status = f"failed ({reason})"
+        STATE.add_log(f"PostgreSQL setup failed; RAG / file search is disabled (non-fatal): {reason}")
+
+
+def start_rag_api() -> None:
+    """
+    Starts LibreChat's official companion `rag_api` connected to PostgreSQL
+    (`DB_HOST`, `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD`, `PGSSLMODE`)
+    and Unity Gateway embeddings.
+    """
+    if STATE.postgres_status not in ("running (ephemeral)", "external"):
+        STATE.rag_api_status = "skipped (PostgreSQL unavailable)"
         return
 
     try:
-        STATE.phase = "Starting LibreChat RAG API connected to Lakebase Autoscaling PostgreSQL..."
+        STATE.phase = "Starting LibreChat RAG API connected to PostgreSQL..."
         STATE.rag_api_status = "starting"
 
         if not (RAG_API_DIR / "main.py").exists():
@@ -1108,16 +1225,17 @@ def start_rag_api_with_lakebase() -> None:
                 prefix="pip-rag-api",
             )
 
+        pg = STATE.postgres
         rag_env = os.environ.copy()
         rag_env.update(
             {
-                "DB_HOST": os.environ["DB_HOST"],
-                "DB_PORT": os.environ.get("DB_PORT", "5432"),
-                "POSTGRES_DB": os.environ["POSTGRES_DB"],
-                "POSTGRES_USER": os.environ["POSTGRES_USER"],
-                "POSTGRES_PASSWORD": os.environ["POSTGRES_PASSWORD"],
+                "DB_HOST": pg["host"],
+                "DB_PORT": pg["port"],
+                "POSTGRES_DB": pg["dbname"],
+                "POSTGRES_USER": pg["user"],
+                "POSTGRES_PASSWORD": pg["password"],
                 "POSTGRES_SCHEMA": os.environ.get("POSTGRES_SCHEMA", "librechat,public"),
-                "PGSSLMODE": "require",
+                "PGSSLMODE": pg["sslmode"],
                 "PGVECTOR_CREATE_EXTENSION": "false",
                 "RAG_PORT": str(RAG_API_PORT),
                 "JWT_SECRET": JWT_SECRET,
@@ -1156,7 +1274,7 @@ def start_rag_api_with_lakebase() -> None:
             os.environ["RAG_API_URL"] = f"http://127.0.0.1:{RAG_API_PORT}"
             os.environ["RAG_PORT"] = str(RAG_API_PORT)
             STATE.add_log(
-                f"LibreChat RAG API listening on http://127.0.0.1:{RAG_API_PORT} (backed by Lakebase PostgreSQL)"
+                f"LibreChat RAG API listening on http://127.0.0.1:{RAG_API_PORT} (backed by PostgreSQL pgvector)"
             )
         else:
             STATE.rag_api_status = "warning (startup timeout)"
@@ -1180,12 +1298,10 @@ def start_librechat_backend(config_path: Path) -> None:
             "NODE_ENV": "production",
             "HOST": "127.0.0.1",
             "PORT": str(LIBRECHAT_INTERNAL_PORT),
-            # 1. Embedded ephemeral MongoDB connection string
+            # 1. MongoDB connection string (LibreChat's only database; PostgreSQL
+            #    is used solely by the RAG API)
             "MONGO_URI": STATE.mongo_uri,
-            # 2. Lakebase Autoscaling PostgreSQL connection string
-            "DATABASE_URL": STATE.database_url,
-            "POSTGRES_URI": STATE.database_url,
-            # 3. Unity Gateway 3-level namespace configuration
+            # 2. Unity Gateway 3-level namespace configuration
             "CONFIG_PATH": str(config_path),
             "DATABRICKS_HOST": STATE.databricks_host,
             "DATABRICKS_TOKEN": STATE.sp_token or "databricks-obo",
@@ -1269,12 +1385,12 @@ def start_librechat_backend(config_path: Path) -> None:
 
 def bootstrap_worker() -> None:
     try:
-        STATE.phase = "Authenticating with Databricks Workspace & Lakebase Autoscaling..."
+        STATE.phase = "Authenticating with Databricks Workspace..."
         w = WorkspaceClient()
         init_databricks_workspace_and_sp_token(w)
-        refresh_lakebase_connection_string(w, initialize_schema=True)
+        setup_postgres()
 
-        # Start background token refresh thread for Lakebase 1-hour OAuth credentials
+        # Start background refresh thread for the Service Principal token
         threading.Thread(target=credential_refresh_loop, daemon=True).start()
 
         preflight_required_tools()
@@ -1282,7 +1398,7 @@ def bootstrap_worker() -> None:
         config_path = render_librechat_yaml()
         ensure_unmodified_librechat_repo(STATE.node_env)
         start_embedded_mongodb(w)
-        start_rag_api_with_lakebase()
+        start_rag_api()
         start_librechat_backend(config_path)
     except Exception as exc:
         logger.exception("Bootstrap error")
@@ -1551,8 +1667,8 @@ def build_loading_html() -> str:
     {err_block}
     <div class="badges">
       <div class="badge">
-        <strong>Lakebase PostgreSQL</strong>
-        {html.escape(STATE.lakebase_status)} ({html.escape(STATE.lakebase_host or 'binding')})
+        <strong>PostgreSQL (pgvector)</strong>
+        {html.escape(STATE.postgres_status)} ({html.escape(STATE.postgres.get('host') or 'pending')})
       </div>
       <div class="badge">
         <strong>Embedded MongoDB</strong>
@@ -1586,11 +1702,12 @@ async def handle_databricks_health(request: web.Request) -> web.Response:
             "ready": STATE.ready,
             "phase": STATE.phase,
             "error": STATE.error,
-            "lakebase": {
-                "status": STATE.lakebase_status,
-                "host": STATE.lakebase_host,
-                "database": STATE.lakebase_db,
-                "endpoint": STATE.lakebase_endpoint,
+            "postgres": {
+                "status": STATE.postgres_status,
+                "host": STATE.postgres.get("host"),
+                "port": STATE.postgres.get("port"),
+                "database": STATE.postgres.get("dbname"),
+                "embedded": STATE.postgres_is_embedded,
             },
             "mongodb": {
                 "status": STATE.mongodb_status,
@@ -1910,7 +2027,7 @@ async def start_servers() -> None:
     await bridge_site.start()
     STATE.add_log(f"Local Unity Gateway OBO bridge listening on 127.0.0.1:{OBO_BRIDGE_PORT}")
 
-    # 3. Launch background bootstrap thread (Lakebase + MongoDB + LibreChat)
+    # 3. Launch background bootstrap thread (PostgreSQL + MongoDB + LibreChat)
     threading.Thread(target=bootstrap_worker, daemon=True).start()
 
     # Keep running

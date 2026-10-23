@@ -6,10 +6,9 @@
 # `resources/librechat.app.yml` under `config:`. Keep the two in sync; the
 # values below are the defaults from databricks.yml.
 #
-# The platform auto-injects PGHOST, PGPORT, PGDATABASE, PGUSER, PGSSLMODE and
-# LAKEBASE_ENDPOINT for the attached `postgres` resource, plus DATABRICKS_HOST,
-# DATABRICKS_APP_PORT, DATABRICKS_CLIENT_ID and DATABRICKS_CLIENT_SECRET. None
-# of those need declaring here.
+# The platform auto-injects DATABRICKS_HOST, DATABRICKS_APP_PORT,
+# DATABRICKS_CLIENT_ID and DATABRICKS_CLIENT_SECRET. None of those need
+# declaring here.
 # Use `python`, NOT `python3`. The Apps runtime installs requirements.txt into
 # its own Python 3.11 virtualenv and puts that interpreter on PATH as `python`;
 # `python3` can resolve to Ubuntu 22.04's system Python 3.10, which has none of
@@ -30,7 +29,15 @@ env:
   - name: MONGO_URI
     value: "mongodb://127.0.0.1:27017/LibreChat"
 
-  # Lakebase PostgreSQL schema for LibreChat RAG / pgvector persistent storage
+  # Same contract as MONGO_URI, for the RAG API's pgvector store: a loopback
+  # host means start the ephemeral PostgreSQL 16 + pgvector embedded in this
+  # container (the RAG index is lost on restart). Point this at any PostgreSQL
+  # with pgvector available for a durable index; the embedded server is then
+  # never started. sslmode defaults to `require` for an external host.
+  - name: POSTGRES_URI
+    value: "postgresql://librechat@127.0.0.1:5432/librechat"
+
+  # PostgreSQL schema search path for LibreChat RAG / pgvector storage
   - name: POSTGRES_SCHEMA
     value: "librechat,public"
 
@@ -38,8 +45,12 @@ env:
   - name: UNITY_GATEWAY_DEFAULT_MODEL
     value: "system.ai.claude-sonnet-5-5"
 
+  # Foundation Model APIs model service names from
+  # https://docs.databricks.com/aws/en/machine-learning/foundation-model-apis/supported-models
+  # (last synced 2026-10-23). Includes chat, image-generation, System One,
+  # and embedding services; embeddings are also set via UNITY_GATEWAY_EMBEDDING_MODEL.
   - name: UNITY_GATEWAY_MODELS
-    value: "system.ai.claude-opus-5-5,system.ai.claude-sonnet-5-5,system.ai.claude-haiku-5-5,system.ai.gpt-5-6-sol"
+    value: "system.ai.databricks-gemini-4-argon,system.ai.gpt-6-1-sol,system.ai.gpt-6-sol,system.ai.gpt-6-luna,system.ai.gpt-6-astra,system.ai.gpt-5-6-sol,system.ai.gpt-5-6-terra,system.ai.gpt-5-6-luna,system.ai.gpt-5-5-pro,system.ai.gpt-5-5,system.ai.gpt-5-4,system.ai.gpt-5-4-mini,system.ai.gpt-5-4-nano,,system.ai.gpt-5-mini,system.ai.gpt-5-nano,system.ai.gemini-3-8-flash,system.ai.gemini-3-7-flash,system.ai.gemini-3-6-flash,system.ai.gemini-3-5-flash,system.ai.gemini-3-5-flash-lite,system.ai.gemini-3-1-pro,system.ai.qwen35-122b-a10b,system.ai.qwen3-next-80b-a3b-instruct,system.ai.grok-4-7,system.ai.grok-4-6,system.ai.glm-5-3,system.ai.glm-5-3-flash,system.ai.kimi-k3,system.ai.gpt-oss-120b,system.ai.gpt-oss-20b,system.ai.gemma-3-12b,system.ai.llama-4-maverick,system.ai.meta-llama-3-3-70b-instruct,system.ai.meta-llama-3-1-8b-instruct,system.ai.claude-haiku-5-5,system.ai.claude-haiku-4-5,system.ai.claude-sonnet-5-5,system.ai.claude-sonnet-5,system.ai.claude-fable-5-1,system.ai.claude-fable-5,system.ai.claude-opus-5-5,system.ai.claude-opus-5,system.ai.claude-opus-4-8"
 
   # Verified against this workspace: `system.ai.gte-large-en` (1024-dim).
   # `system.ai.databricks-gte-large-en` does NOT exist and returns 404.

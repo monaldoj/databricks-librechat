@@ -2,15 +2,16 @@ resources:
   apps:
     librechat_app:
       name: ${var.app_name}
-      description: "Unmodified LibreChat on Databricks Apps with Lakebase Autoscaling (PostgreSQL) for its pgvector/RAG store, ephemeral embedded MongoDB, and Unity Gateway OBO for 3-level namespace Models & MCPs"
+      description: "Unmodified LibreChat on Databricks Apps with ephemeral embedded MongoDB and PostgreSQL (pgvector/RAG) -- each replaceable by an external server via one env var -- and Unity Gateway OBO for 3-level namespace Models & MCPs"
       source_code_path: ../app
       compute_size: ${var.app_compute_size}
 
       # LibreChat keeps all of its state in MongoDB, and the embedded mongod
-      # lives in this container. More than one instance would mean one
-      # independent database (and one independent JWT secret) per replica, so
-      # sessions and history would break at random. Pin to exactly one.
-      # When MONGO_URI points at an external managed MongoDB, this can be raised.
+      # (and embedded PostgreSQL) live in this container. More than one instance
+      # would mean one independent database (and one independent JWT secret) per
+      # replica, so sessions and history would break at random. Pin to exactly
+      # one. When MONGO_URI and POSTGRES_URI both point at external servers,
+      # this can be raised.
       compute_min_instances: 1
       compute_max_instances: 1
 
@@ -20,7 +21,7 @@ resources:
         started: true
 
       # Service-level scopes the On-Behalf-Of token (`x-forwarded-access-token`)
-      # is allowed to exercise against Unity Gateway and Lakebase.
+      # is allowed to exercise against Unity Gateway.
       #
       # Do NOT list `iam.current-user:read` / `iam.access-control:read` here.
       # Those are assigned implicitly by the platform and are rejected when
@@ -37,7 +38,6 @@ resources:
         - genie
         - files
         - vector-search
-        - postgres
 
       # Runtime command + environment. This is the DAB-managed copy, where
       # `${var.*}` is resolved at deploy time. `app/app.yaml` carries the same
@@ -59,7 +59,13 @@ resources:
           - name: MONGO_URI
             value: ${var.mongo_uri}
 
-          # Lakebase PostgreSQL schema for LibreChat's RAG / pgvector storage.
+          # Same contract as MONGO_URI, for the RAG API's pgvector store: a
+          # loopback host means start the ephemeral PostgreSQL embedded in this
+          # container; any other host is used as-is and is durable.
+          - name: POSTGRES_URI
+            value: ${var.postgres_uri}
+
+          # PostgreSQL schema search path for LibreChat's RAG / pgvector storage.
           - name: POSTGRES_SCHEMA
             value: "librechat,public"
 
@@ -80,15 +86,6 @@ resources:
             value: /Volumes/${var.state_catalog}/${var.state_schema}/${var.state_volume}
 
       resources:
-        - name: postgres
-          description: "Lakebase Autoscaling PostgreSQL database for LibreChat's pgvector / RAG storage"
-          postgres:
-            branch: ${resources.postgres_branches.librechat_branch.id}
-            # `lakebase_database_id` is the hyphenated Lakebase resource ID,
-            # not the underscored PostgreSQL database name. See databricks.yml.
-            database: ${resources.postgres_branches.librechat_branch.id}/databases/${var.lakebase_database_id}
-            permission: CAN_CONNECT_AND_CREATE
-
         - name: state-volume
           description: "UC Volume caching the mongod binary for faster, egress-independent cold starts"
           uc_securable:
