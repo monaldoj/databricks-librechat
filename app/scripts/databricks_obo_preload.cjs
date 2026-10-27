@@ -139,6 +139,182 @@ function isUnityGatewayUrl(urlStr) {
 }
 
 // -----------------------------------------------------------------------------
+// 0. Provider compatibility for Unity Gateway `/chat/completions`
+// -----------------------------------------------------------------------------
+// Every model shares one LibreChat custom endpoint, so LibreChat shapes every
+// request the same (OpenAI) way. Three provider rules on the gateway then break
+// MCP tool use for everything except Claude. Each was reproduced directly
+// against POST /ai-gateway/mlflow/v1/chat/completions:
+//
+// 1. GPT-5.6 / GPT-6 (sol, terra, luna, astra) reason by default and reject
+//    function tools on Chat Completions while reasoning:
+//      Function tools with reasoning_effort are not supported for gpt-5.6-sol
+//      in /v1/chat/completions. To use function tools, use /v1/responses or
+//      set reasoning_effort to 'none'.
+//    start_app.py already puts these models on a separate LibreChat endpoint
+//    that uses the Responses API (RESPONSES_API_MODELS), so this is only a
+//    backstop for one served over Chat Completions anyway: when tools are
+//    attached, send `reasoning_effort: "none"`. That cannot rescue
+//    gpt-6-1-sol / gpt-6-astra, which reject 'none'.
+// 2. Gemini rejects `stream_options`, which LibreChat sends on every streamed
+//    request, tools or not:
+//      Invalid JSON payload received. Unknown name "stream_options" at
+//      'generation_config': Cannot find field.
+// 3. Gemini 3 requires the `thoughtSignature` it attached to each tool call to
+//    be sent back with that call on the next turn:
+//      Function call is missing a thought_signature in functionCall parts.
+//    LibreChat's OpenAI message conversion drops the field. Fix: remember the
+//    signatures from responses and re-attach them. If one is unknown (e.g. the
+//    conversation predates a restart), use Google's documented
+//    validator-skip value instead.
+const GPT_TOOLS_REQUIRE_NO_REASONING = /(?:^|[./])gpt-(?:5-6|6(?:-\d+)?)(?:-|$)/i;
+const GEMINI_MODEL = /gemini-/i;
+const GEMINI_SKIP_SIGNATURE = 'skip_thought_signature_validator';
+const GEMINI_SIGNATURE_CACHE_MAX = 5000;
+const geminiSignatures = new Map();
+
+function isChatCompletionsUrl(urlStr) {
+  try {
+    return new URL(urlStr).pathname.endsWith('/chat/completions');
+  } catch (_) {
+    return false;
+  }
+}
+
+// Gemini reuses the function name as the tool call id, so the id alone is not
+// unique. Arguments are normalized because LibreChat re-serializes them.
+function geminiToolCallKey(call) {
+  const fn = (call && call.function) || {};
+  let args = fn.arguments == null ? '' : String(fn.arguments);
+  try {
+    args = JSON.stringify(JSON.parse(args));
+  } catch (_) {
+    // keep the raw string
+  }
+  return `${call.id || ''}|${fn.name || ''}|${args}`;
+}
+
+function rememberGeminiSignature(call) {
+  if (!call || typeof call.thoughtSignature !== 'string' || !call.thoughtSignature) return;
+  const key = geminiToolCallKey(call);
+  geminiSignatures.delete(key);
+  geminiSignatures.set(key, call.thoughtSignature);
+  if (geminiSignatures.size > GEMINI_SIGNATURE_CACHE_MAX) {
+    geminiSignatures.delete(geminiSignatures.keys().next().value);
+  }
+}
+
+function applyGatewayCompatibility(urlString, body) {
+  const result = { body, changes: [], gemini: false, stream: false };
+  if (typeof body !== 'string' || !isChatCompletionsUrl(urlString)) return result;
+  let payload;
+  try {
+    payload = JSON.parse(body);
+  } catch (_) {
+    return result;
+  }
+  const model = typeof payload.model === 'string' ? payload.model : '';
+  result.stream = payload.stream === true;
+
+  const hasTools = Array.isArray(payload.tools) && payload.tools.length > 0;
+  if (hasTools && GPT_TOOLS_REQUIRE_NO_REASONING.test(model) && payload.reasoning_effort !== 'none') {
+    payload.reasoning_effort = 'none';
+    result.changes.push('reasoning_effort=none');
+  }
+
+  if (GEMINI_MODEL.test(model)) {
+    result.gemini = true;
+    if ('stream_options' in payload) {
+      delete payload.stream_options;
+      result.changes.push('-stream_options');
+    }
+    let restored = 0;
+    let skipped = 0;
+    for (const msg of Array.isArray(payload.messages) ? payload.messages : []) {
+      if (!msg || msg.role !== 'assistant' || !Array.isArray(msg.tool_calls)) continue;
+      for (const call of msg.tool_calls) {
+        if (!call || call.thoughtSignature) continue;
+        const known = geminiSignatures.get(geminiToolCallKey(call));
+        call.thoughtSignature = known || GEMINI_SKIP_SIGNATURE;
+        if (known) restored += 1;
+        else skipped += 1;
+      }
+    }
+    if (restored) result.changes.push(`thoughtSignature restored x${restored}`);
+    if (skipped) result.changes.push(`thoughtSignature skip-validator x${skipped}`);
+  }
+
+  if (result.changes.length) {
+    result.body = JSON.stringify(payload);
+    console.log(`[UnityGateway-Compat] ${model}: ${result.changes.join(', ')}`);
+  }
+  return result;
+}
+
+async function recordGeminiSignaturesFromStream(stream) {
+  const decoder = new TextDecoder();
+  const calls = new Map();
+  let buffer = '';
+  const handleLine = (line) => {
+    if (!line.startsWith('data:')) return;
+    const data = line.slice(5).trim();
+    if (!data || data === '[DONE]') return;
+    let chunk;
+    try {
+      chunk = JSON.parse(data);
+    } catch (_) {
+      return;
+    }
+    for (const choice of chunk.choices || []) {
+      const deltas = (choice.delta && choice.delta.tool_calls) || [];
+      for (const tc of deltas) {
+        const slot = `${choice.index || 0}:${tc.index || 0}`;
+        const entry = calls.get(slot) || {
+          id: '',
+          function: { name: '', arguments: '' },
+          thoughtSignature: '',
+        };
+        if (tc.id) entry.id = tc.id;
+        if (tc.function && tc.function.name) entry.function.name = tc.function.name;
+        if (tc.function && tc.function.arguments) entry.function.arguments += tc.function.arguments;
+        if (tc.thoughtSignature) entry.thoughtSignature = tc.thoughtSignature;
+        calls.set(slot, entry);
+      }
+    }
+  };
+  for await (const piece of stream) {
+    buffer += decoder.decode(piece, { stream: true });
+    let newline;
+    while ((newline = buffer.indexOf('\n')) >= 0) {
+      handleLine(buffer.slice(0, newline).trim());
+      buffer = buffer.slice(newline + 1);
+    }
+  }
+  handleLine(buffer.trim());
+  for (const call of calls.values()) rememberGeminiSignature(call);
+}
+
+// Reads a clone, so the caller's response is untouched.
+function captureGeminiSignatures(response, stream) {
+  try {
+    if (!response || !response.ok || !response.body) return;
+    const copy = response.clone();
+    const done = stream
+      ? recordGeminiSignaturesFromStream(copy.body)
+      : copy.json().then((data) => {
+          for (const choice of (data && data.choices) || []) {
+            for (const call of (choice.message && choice.message.tool_calls) || []) {
+              rememberGeminiSignature(call);
+            }
+          }
+        });
+    done.catch((e) => console.warn('[UnityGateway-Compat] thoughtSignature capture warning:', e.message));
+  } catch (e) {
+    console.warn('[UnityGateway-Compat] thoughtSignature capture warning:', e.message);
+  }
+}
+
+// -----------------------------------------------------------------------------
 // 1. Hook incoming HTTP requests to LibreChat (`http.Server.prototype.emit`)
 // -----------------------------------------------------------------------------
 const originalHttpEmit = http.Server.prototype.emit;
@@ -266,7 +442,17 @@ function wrapFetchImplementation(originalFetch, label) {
       console.log(
         `[UnityGateway-OBO:${label}] ${method} ${urlString} -> auth=${resolved ? resolved.source : 'none'}`,
       );
-      return originalFetch.call(this, input, mergedInit);
+
+      const compat = applyGatewayCompatibility(urlString, mergedInit.body);
+      if (compat.changes.length) {
+        mergedInit.body = compat.body;
+        for (const key of Object.keys(headers)) {
+          if (key.toLowerCase() === 'content-length') delete headers[key];
+        }
+      }
+      const response = await originalFetch.call(this, input, mergedInit);
+      if (compat.gemini) captureGeminiSignatures(response, compat.stream);
+      return response;
     }
 
     return originalFetch.apply(this, arguments);

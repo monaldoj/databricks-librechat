@@ -21,7 +21,7 @@ version: 1.3.17
 cache: true
 
 interface:
-  customWelcome: "Welcome to LibreChat on Databricks Apps — governed by Unity Gateway & backed by Lakebase Autoscaling"
+  customWelcome: "Welcome to LibreChat on Databricks Apps — governed by Unity Gateway"
   endpointsMenu: true
   modelSelect: true
   parameters: true
@@ -121,6 +121,12 @@ mcpServers:
 # which `/responses` rejects outright). "Unified" means one request shape across
 # providers -- it does NOT mean the gateway normalizes away per-provider
 # parameter support, so see `dropParams` below.
+#
+# `scripts/start_app.py` splits this endpoint in two at render time: GPT-5.6,
+# GPT-6 and gpt-5-5-pro move to a copy named "Databricks Unity Gateway
+# Responses API" with `addParams.useResponsesApi: true`, because their function
+# tools (MCP) only work on `/responses` (see RESPONSES_API_MODELS). Gemini
+# quirks on `/chat/completions` are handled in scripts/databricks_obo_preload.cjs.
 endpoints:
   allowedAddresses:
     - "127.0.0.1:3081"
@@ -137,7 +143,7 @@ endpoints:
           - "system.ai.claude-opus-5-5"
           - "system.ai.claude-sonnet-5-5"
           - "system.ai.claude-haiku-5-5"
-          - "system.ai.gpt-5-6-sol"
+          - "system.ai.gpt-6-1-sol"
         fetch: false
 
       # REQUIRED for the Anthropic (`system.ai.claude-*`) model services.

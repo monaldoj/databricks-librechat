@@ -291,6 +291,22 @@ in `unity_gateway_mcp_services`, so you can still write FQNs there. It also:
 - disambiguates the case where two FQNs sanitize to the same key (`a.b.c` and `a_b.c`)
   instead of silently dropping one.
 
+#### MCP tools with GPT and Gemini
+
+Claude handles tools on `/chat/completions` as-is. The other providers each break a
+different way behind Unity Gateway, all surfacing in LibreChat as
+`The model provider could not complete this request (status 400)`:
+
+| Models | Gateway error | Fix |
+|--------|---------------|-----|
+| GPT-5.6, GPT-6 (`sol`/`terra`/`luna`/`astra`), `gpt-5-5-pro` | `Function tools with reasoning_effort are not supported ... in /v1/chat/completions` (`gpt-5-5-pro`: Responses-only) | `start_app.py` moves them to a second endpoint, **Databricks Unity Gateway Responses API**, with `useResponsesApi: true` (`RESPONSES_API_MODELS`). Its titles use `UNITY_GATEWAY_RESPONSES_TITLE_MODEL` (default `system.ai.gpt-5-4-nano`). |
+| Gemini | `Unknown name "stream_options"`, sent by LibreChat on every streamed request | The preload hook deletes `stream_options` for `gemini-*`. |
+| Gemini 3 | `Function call is missing a thought_signature` on the turn after a tool call | The preload hook remembers each tool call's `thoughtSignature` and re-attaches it, falling back to Google's `skip_thought_signature_validator` if it is unknown (e.g. after a restart). |
+
+LibreChat only routes GPT-5.6/GPT-6 to the Responses API on its own for `api.openai.com`,
+and its OpenAI message conversion drops `thoughtSignature`, so neither can be fixed in
+`librechat.yaml` alone. Rewrites are logged as `[UnityGateway-Compat]`.
+
 ### Overriding them
 
 These are real bundle variables, resolved into the app's `config.env` at deploy time:

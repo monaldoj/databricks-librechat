@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import copy
 import hashlib
 import hmac
 import html
@@ -121,13 +122,40 @@ SP_TOKEN_FILE = Path("/tmp/databricks_sp_token")
 DEFAULT_EMBEDDING_MODEL = "system.ai.gte-large-en"
 DEFAULT_CHAT_MODEL = "system.ai.claude-sonnet-5-5"
 DEFAULT_CHAT_MODELS = (
-    "system.ai.claude-opus-5-5,system.ai.claude-sonnet-5-5,"
-    "system.ai.claude-haiku-5-5,system.ai.gpt-5-6-sol"
+    "system.ai.claude-opus-5-5,"
+    "system.ai.claude-sonnet-5-5,"
+    "system.ai.claude-haiku-5-5,"
+    "system.ai.gpt-6-1-sol,"
+    "system.ai.gpt-6-luna,"
+    "system.ai.gpt-6-astra,"
+    "system.ai.gpt-5-5,"
+    "system.ai.gpt-5-4-mini,"
+    "system.ai.gemini-3-8-flash,"
+    "system.ai.gemini-3-1-flash-lite,"
+    "system.ai.gpt-oss-120b,"
+    "system.ai.llama-4-maverick,"
+    "system.ai.grok-4-7"
 )
 DEFAULT_MCP_SERVICES = "system.ai.dbsql,system.ai.genie_one_mcp,system.ai.web_search"
 # Conversation titles are generated on every new chat, so default them to the
 # cheapest capable model rather than whatever the user picked for chat.
 DEFAULT_TITLE_MODEL = "system.ai.claude-haiku-5-5"
+
+# GPT model services whose function tools only work on Unity Gateway's
+# Responses API. Each was reproduced against /ai-gateway/mlflow/v1:
+#   - GPT-5.6 / GPT-6 reason by default, and Chat Completions rejects tools
+#     while reasoning ("Function tools with reasoning_effort are not supported
+#     ... use /v1/responses"). gpt-6-1-sol and gpt-6-astra cannot turn
+#     reasoning off at all ("reasoning_effort does not support 'none'").
+#   - gpt-5-5-pro serves the Responses API only, tools or not.
+# LibreChat itself routes these to Responses only for api.openai.com, so they
+# get a second custom endpoint with `useResponsesApi: true`; everything else
+# stays on Chat Completions, which is what Claude and Gemini need.
+RESPONSES_API_MODELS = re.compile(r"(?:^|[./])gpt-(?:5-6|6(?:-\d+)?|5-5-pro)(?:-|$)", re.IGNORECASE)
+RESPONSES_ENDPOINT_NAME = "Databricks Unity Gateway Responses API"
+# The Responses endpoint generates its own titles, so it needs a model that
+# speaks that API; verified on /responses.
+DEFAULT_RESPONSES_TITLE_MODEL = "system.ai.gpt-5-4-nano"
 
 # Sampling parameters that Unity Gateway's Anthropic (`system.ai.claude-*`)
 # model services reject with a 400, and that LibreChat would otherwise send on
@@ -579,6 +607,29 @@ def render_librechat_yaml() -> Path:
                 declared.append(param)
         ugw_endpoint["dropParams"] = declared
 
+        # Split off the models that need the Responses API (see
+        # RESPONSES_API_MODELS). The copy keeps the same headers and
+        # dropParams -- gpt-6-1-sol rejects LibreChat's default
+        # `temperature`/`top_p` there too.
+        responses_models = [m for m in models if RESPONSES_API_MODELS.search(m)]
+        chat_models = [m for m in models if m not in responses_models]
+        if responses_models:
+            add_params = dict(ugw_endpoint.get("addParams") or {})
+            add_params["useResponsesApi"] = True
+            if chat_models:
+                ugw_endpoint["models"]["default"] = chat_models
+                responses_endpoint = copy.deepcopy(ugw_endpoint)
+                responses_endpoint["name"] = RESPONSES_ENDPOINT_NAME
+                responses_endpoint["models"] = {"default": responses_models, "fetch": False}
+                responses_endpoint["titleModel"] = (
+                    os.environ.get("UNITY_GATEWAY_RESPONSES_TITLE_MODEL")
+                    or DEFAULT_RESPONSES_TITLE_MODEL
+                ).strip()
+                responses_endpoint["addParams"] = add_params
+                custom_endpoints.insert(1, responses_endpoint)
+            else:
+                ugw_endpoint["addParams"] = add_params
+
     # 2. Allow the workspace host through LibreChat's SSRF guard.
     #
     # Inside the Databricks Apps VPC the workspace hostname resolves to a PRIVATE
@@ -651,6 +702,12 @@ def render_librechat_yaml() -> Path:
     STATE.add_log(
         f"Rendered {RENDERED_CONFIG_PATH} with Unity Gateway 3-level models={models} and MCPs={mcp_services}"
     )
+    for endpoint in custom_endpoints:
+        STATE.add_log(
+            f"LibreChat endpoint '{endpoint.get('name')}': "
+            f"{'Responses API' if (endpoint.get('addParams') or {}).get('useResponsesApi') else 'Chat Completions'}, "
+            f"{len((endpoint.get('models') or {}).get('default') or [])} models"
+        )
     return RENDERED_CONFIG_PATH
 
 
