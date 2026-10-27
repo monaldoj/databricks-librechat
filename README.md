@@ -302,6 +302,7 @@ different way behind Unity Gateway, all surfacing in LibreChat as
 | GPT-5.6, GPT-6 (`sol`/`terra`/`luna`/`astra`), `gpt-5-5-pro` | `Function tools with reasoning_effort are not supported ... in /v1/chat/completions` (`gpt-5-5-pro`: Responses-only) | `start_app.py` moves them to a second endpoint, **Databricks Unity Gateway Responses API**, with `useResponsesApi: true` (`RESPONSES_API_MODELS`). Its titles use `UNITY_GATEWAY_RESPONSES_TITLE_MODEL` (default `system.ai.gpt-5-4-nano`). |
 | Gemini | `Unknown name "stream_options"`, sent by LibreChat on every streamed request | The preload hook deletes `stream_options` for `gemini-*`. |
 | Gemini 3 | `Function call is missing a thought_signature` on the turn after a tool call | The preload hook remembers each tool call's `thoughtSignature` and re-attaches it, falling back to Google's `skip_thought_signature_validator` if it is unknown (e.g. after a restart). |
+| Gemini | Calling the same tool twice in one turn (e.g. `genie_poll_response` while Genie is still working) fails with `Requests ending with a model turn are not supported`. Gemini uses the function name as the tool call id, so LibreChat treats the repeat as already answered and never runs it. | The preload hook gives every Gemini tool call a unique id in the response before LibreChat sees it. |
 
 LibreChat only routes GPT-5.6/GPT-6 to the Responses API on its own for `api.openai.com`,
 and its OpenAI message conversion drops `thoughtSignature`, so neither can be fixed in

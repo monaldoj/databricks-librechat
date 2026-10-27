@@ -31,6 +31,7 @@ const http = require('node:http');
 const https = require('node:https');
 const Module = require('node:module');
 const { AsyncLocalStorage } = require('node:async_hooks');
+const { randomUUID } = require('node:crypto');
 
 const oboStorage = new AsyncLocalStorage();
 const tokensByEmail = new Map();
@@ -167,6 +168,14 @@ function isUnityGatewayUrl(urlStr) {
 //    signatures from responses and re-attach them. If one is unknown (e.g. the
 //    conversation predates a restart), use Google's documented
 //    validator-skip value instead.
+// 4. Gemini uses the function name as the tool call id, so calling the same
+//    tool twice in one turn (e.g. `genie_poll_response` while Genie is still
+//    working) yields two calls with the same id. LibreChat's ToolNode skips
+//    any call whose id already has a tool result, so the repeat never runs,
+//    and the next request ends on an unanswered call:
+//      Requests ending with a model turn are not supported.
+//    Fix: give each Gemini tool call a unique id in the response before
+//    LibreChat sees it. The gateway accepts any id on the way back.
 const GPT_TOOLS_REQUIRE_NO_REASONING = /(?:^|[./])gpt-(?:5-6|6(?:-\d+)?)(?:-|$)/i;
 const GEMINI_MODEL = /gemini-/i;
 const GEMINI_SKIP_SIGNATURE = 'skip_thought_signature_validator';
@@ -251,67 +260,99 @@ function applyGatewayCompatibility(urlString, body) {
   return result;
 }
 
-async function recordGeminiSignaturesFromStream(stream) {
-  const decoder = new TextDecoder();
-  const calls = new Map();
-  let buffer = '';
-  const handleLine = (line) => {
-    if (!line.startsWith('data:')) return;
-    const data = line.slice(5).trim();
-    if (!data || data === '[DONE]') return;
-    let chunk;
-    try {
-      chunk = JSON.parse(data);
-    } catch (_) {
-      return;
-    }
-    for (const choice of chunk.choices || []) {
-      const deltas = (choice.delta && choice.delta.tool_calls) || [];
-      for (const tc of deltas) {
-        const slot = `${choice.index || 0}:${tc.index || 0}`;
-        const entry = calls.get(slot) || {
-          id: '',
-          function: { name: '', arguments: '' },
-          thoughtSignature: '',
-        };
-        if (tc.id) entry.id = tc.id;
-        if (tc.function && tc.function.name) entry.function.name = tc.function.name;
-        if (tc.function && tc.function.arguments) entry.function.arguments += tc.function.arguments;
-        if (tc.thoughtSignature) entry.thoughtSignature = tc.thoughtSignature;
-        calls.set(slot, entry);
-      }
-    }
-  };
-  for await (const piece of stream) {
-    buffer += decoder.decode(piece, { stream: true });
-    let newline;
-    while ((newline = buffer.indexOf('\n')) >= 0) {
-      handleLine(buffer.slice(0, newline).trim());
-      buffer = buffer.slice(newline + 1);
-    }
-  }
-  handleLine(buffer.trim());
-  for (const call of calls.values()) rememberGeminiSignature(call);
+function uniqueGeminiToolCallId() {
+  return `call_${randomUUID().replace(/-/g, '').slice(0, 24)}`;
 }
 
-// Reads a clone, so the caller's response is untouched.
-function captureGeminiSignatures(response, stream) {
-  try {
-    if (!response || !response.ok || !response.body) return;
-    const copy = response.clone();
-    const done = stream
-      ? recordGeminiSignaturesFromStream(copy.body)
-      : copy.json().then((data) => {
-          for (const choice of (data && data.choices) || []) {
-            for (const call of (choice.message && choice.message.tool_calls) || []) {
-              rememberGeminiSignature(call);
-            }
-          }
-        });
-    done.catch((e) => console.warn('[UnityGateway-Compat] thoughtSignature capture warning:', e.message));
-  } catch (e) {
-    console.warn('[UnityGateway-Compat] thoughtSignature capture warning:', e.message);
+// Rewrites one parsed chunk/completion in place: unique tool call ids, and
+// signatures recorded under those ids. `slots` keeps one id per tool call
+// across the chunks of a stream.
+function rewriteGeminiToolCalls(data, slots, stream) {
+  let changed = false;
+  for (const choice of (data && data.choices) || []) {
+    const holder = stream ? choice.delta : choice.message;
+    for (const tc of (holder && holder.tool_calls) || []) {
+      const slot = `${choice.index || 0}:${stream ? tc.index || 0 : tc.id}`;
+      const entry = slots.get(slot) || {
+        id: uniqueGeminiToolCallId(),
+        function: { name: '', arguments: '' },
+        thoughtSignature: '',
+      };
+      if (tc.id) {
+        tc.id = entry.id;
+        changed = true;
+      }
+      if (tc.function && tc.function.name) entry.function.name = tc.function.name;
+      if (tc.function && tc.function.arguments) entry.function.arguments += tc.function.arguments;
+      if (tc.thoughtSignature) entry.thoughtSignature = tc.thoughtSignature;
+      slots.set(slot, entry);
+    }
   }
+  return changed;
+}
+
+function rewriteGeminiSseLine(line, slots) {
+  const trimmed = line.trim();
+  if (!trimmed.startsWith('data:')) return line;
+  const data = trimmed.slice(5).trim();
+  if (!data || data === '[DONE]' || !data.includes('tool_calls')) return line;
+  try {
+    const chunk = JSON.parse(data);
+    return rewriteGeminiToolCalls(chunk, slots, true) ? `data: ${JSON.stringify(chunk)}` : line;
+  } catch (_) {
+    return line;
+  }
+}
+
+// Returns a Response whose Gemini tool call ids are unique (see 4. above),
+// recording each call's thoughtSignature (see 3.) as it passes through.
+async function transformGeminiResponse(response, stream) {
+  if (!response || !response.ok || !response.body) return response;
+  const headers = new Headers(response.headers);
+  headers.delete('content-length');
+  headers.delete('content-encoding');
+  const init = { status: response.status, statusText: response.statusText, headers };
+  const slots = new Map();
+  const finish = () => {
+    for (const call of slots.values()) rememberGeminiSignature(call);
+  };
+  let body;
+  if (stream) {
+    const decoder = new TextDecoder();
+    const encoder = new TextEncoder();
+    let buffer = '';
+    body = response.body.pipeThrough(
+      new TransformStream({
+        transform(piece, controller) {
+          buffer += decoder.decode(piece, { stream: true });
+          let newline;
+          while ((newline = buffer.indexOf('\n')) >= 0) {
+            const line = buffer.slice(0, newline);
+            buffer = buffer.slice(newline + 1);
+            controller.enqueue(encoder.encode(`${rewriteGeminiSseLine(line, slots)}\n`));
+          }
+        },
+        flush(controller) {
+          buffer += decoder.decode();
+          if (buffer) controller.enqueue(encoder.encode(rewriteGeminiSseLine(buffer, slots)));
+          finish();
+        },
+      }),
+    );
+  } else {
+    const text = await response.text();
+    body = text;
+    try {
+      const data = JSON.parse(text);
+      if (rewriteGeminiToolCalls(data, slots, false)) body = JSON.stringify(data);
+      finish();
+    } catch (_) {
+      // not JSON; pass through untouched
+    }
+  }
+  const out = new Response(body, init);
+  Object.defineProperty(out, 'url', { value: response.url });
+  return out;
 }
 
 // -----------------------------------------------------------------------------
@@ -451,7 +492,13 @@ function wrapFetchImplementation(originalFetch, label) {
         }
       }
       const response = await originalFetch.call(this, input, mergedInit);
-      if (compat.gemini) captureGeminiSignatures(response, compat.stream);
+      if (compat.gemini) {
+        try {
+          return await transformGeminiResponse(response, compat.stream);
+        } catch (e) {
+          console.warn('[UnityGateway-Compat] Gemini response rewrite warning:', e.message);
+        }
+      }
       return response;
     }
 
