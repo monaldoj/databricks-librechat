@@ -1,6 +1,12 @@
 # yaml-language-server: $schema=bundle_config_schema.json
 bundle:
   name: databricks-librechat
+  # Required for skip_name_prefix_for_schema and the computed volume_path.
+  databricks_cli_version: ">= 1.20.0"
+
+# Keep the explicitly configured schema name in development mode as well.
+experimental:
+  skip_name_prefix_for_schema: true
 
 include:
   - resources/*.yml
@@ -81,6 +87,9 @@ targets:
     default: true
     variables:
       app_name: "librechat-dev"
+      state_catalog: "justinm_demo"
+      state_schema: "librechat_dev"
+      state_volume: "app_state"
 
   prod:
     mode: production
@@ -95,3 +104,6 @@ targets:
       root_path: ${var.prod_root_path}
     variables:
       app_name: "librechat"
+      state_catalog: "justinm_demo"
+      state_schema: "librechat"
+      state_volume: "app_state"

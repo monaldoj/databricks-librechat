@@ -83,12 +83,13 @@ resources:
           # Used only to cache the downloaded mongod binary, so a cold start
           # does not depend on egress to fastdl.mongodb.org every time.
           - name: LIBRECHAT_STATE_VOLUME
-            value: /Volumes/${var.state_catalog}/${var.state_schema}/${var.state_volume}
+            value: ${resources.volumes.librechat_state_volume.volume_path}
 
       resources:
         - name: state-volume
           description: "UC Volume caching the mongod binary for faster, egress-independent cold starts"
           uc_securable:
             securable_type: VOLUME
-            securable_full_name: ${var.state_catalog}.${var.state_schema}.${var.state_volume}
+            # The resource reference makes app creation wait for the volume.
+            securable_full_name: ${resources.volumes.librechat_state_volume.id}
             permission: WRITE_VOLUME
